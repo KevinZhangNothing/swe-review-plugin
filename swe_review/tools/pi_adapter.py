@@ -1,0 +1,154 @@
+"""
+PiAdapter - 通过 pi CLI 走 `pi --mode print -p` headless（subprocess 即可）
+
+参考:
+- /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/docs/skills.md
+- ~/.pi/agent/skills/<name>/SKILL.md 是 Pi 标准发现路径
+- 我们的 swe-review-* SKILL.md 通过 install.sh 已复制到该路径下
+
+Pi 比 Claude Code 友好：subprocess.run 直接可调，不需要 pty。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+
+from ._pty_runner import (
+    run_subprocess, strip_ansi, strip_fences, extract_tokens_from_text,
+)
+
+
+PI_DEFAULT_SKILLS_ROOT = Path("~/.pi/agent/skills").expanduser()
+
+
+def _find_cli() -> str:
+    return (
+        os.environ.get("PI_BIN")
+        or shutil.which("pi")
+        or "pi"
+    )
+
+
+class PiAdapter:
+    name = "pi"
+
+    def __init__(
+        self,
+        cli_path: Optional[str] = None,
+        model: Optional[str] = None,
+        skills_dir: Optional[str] = None,
+        timeout: int = 600,
+        auto_install_skills: bool = True,
+        skills_source_dir: Optional[Path] = None,
+    ):
+        self.cli_path = cli_path or _find_cli()
+        self.model = model or os.environ.get("PI_MODEL")
+        self.skills_dir = Path(skills_dir).expanduser() if skills_dir else PI_DEFAULT_SKILLS_ROOT
+        self.timeout = timeout
+        self.auto_install_skills = auto_install_skills
+        # 默认 skills source: 工程内 .claude/skills
+        if skills_source_dir:
+            self.skills_source_dir = Path(skills_source_dir)
+        else:
+            # from package resource: swe_review/.claude_skills/
+            pkg_root = Path(__file__).resolve().parent.parent
+            candidate = pkg_root / ".claude_skills"
+            self.skills_source_dir = candidate if candidate.exists() else (pkg_root.parent / ".claude" / "skills")
+
+    async def install_skills(self) -> Dict[str, str]:
+        target = self.skills_dir / "swe-review"
+        target.mkdir(parents=True, exist_ok=True)
+        installed: Dict[str, str] = {}
+
+        if not self.skills_source_dir.exists():
+            return installed
+
+        for skill_path in self.skills_source_dir.iterdir():
+            if not skill_path.is_dir():
+                continue
+            if not (skill_path / "SKILL.md").exists():
+                continue
+            dest = target / skill_path.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(skill_path, dest)
+            installed[skill_path.name] = str(dest)
+        return installed
+
+    async def chat(
+        self,
+        system: str,
+        user: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+    ) -> Tuple[str, Dict[str, int]]:
+        if self.auto_install_skills:
+            await self.install_skills()
+
+        full_prompt = (
+            f"{system}\n\n{user}\n\n"
+            "IMPORTANT: Output ONLY valid JSON. No prose, no markdown fences."
+        )
+
+        argv = [self.cli_path, "--mode", "print", "-p", full_prompt]
+        if self.model:
+            argv += ["--model", self.model]
+
+        env = {"PI_NO_TUI": "1"}
+        out, err, rc = run_subprocess(argv, timeout=self.timeout, extra_env=env)
+        text_clean = strip_ansi(out)
+        if rc != 0:
+            err_tail = (err or text_clean)[-500:]
+            raise RuntimeError(
+                f"pi --mode print failed (rc={rc}). stderr_tail={err_tail!r}"
+            )
+        text = strip_fences(text_clean)
+        tok = extract_tokens_from_text(text, full_prompt)
+        return text, tok
+
+    async def review(self, issue, pr_diff, repo_context=None):
+        system = "You are an expert code reviewer. Output JSON only."
+        user = (
+            f"Issue:\n{issue}\n\nPR Diff:\n```diff\n{pr_diff}\n```\n\n"
+            f"Context:\n{json.dumps(repo_context or {}, ensure_ascii=False)}\n\n"
+            "Return JSON: {decision, confidence, summary, defects[]}."
+        )
+        return await self.chat(system=system, user=user)
+
+    async def revise(self, issue, original_pr_diff, review_feedback):
+        system = "You are a code revision expert. Output JSON only."
+        user = (
+            f"Issue:\n{issue}\n\nOriginal Diff:\n```diff\n{original_pr_diff}\n```\n\n"
+            f"Feedback:\n{json.dumps(review_feedback, ensure_ascii=False, indent=2)}\n\n"
+            "Return JSON: {title, body, diff, changes_summary, addressed_defect_indices[]}."
+        )
+        return await self.chat(system=system, user=user)
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "cli": self.cli_path,
+            "configured": bool(shutil.which(self.cli_path)),
+            "skills_dir": str(self.skills_dir),
+            "model": self.model,
+        }
+
+    def diagnose(self) -> Dict[str, Any]:
+        import shutil
+        return {
+            "tool": self.name,
+            "cli_present": bool(shutil.which(self.cli_path)),
+            "skills_dir": str(self.skills_dir),
+            "command_template": f"{self.cli_path} --mode print -p <prompt>",
+            "hint": (
+                "Pi reads API keys from `~/.pi/agent/auth.json`. The installed "
+                "swe-review skills are auto-copied to "
+                "`~/.pi/agent/skills/swe-review/` and discovered on `pi` startup."
+            ),
+        }

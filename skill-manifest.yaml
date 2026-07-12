@@ -1,0 +1,100 @@
+# SWE-Review Plugin Skill Manifest (informational)
+#
+# This file is a *human + CI reference* for the Skill surface. The actual
+# CLI/agent consumable Skill files are .claude/skills/swe-review-*/SKILL.md
+# and (via install.sh) copied to ~/.claude/skills/ and ~/.pi/agent/skills/swe-review/.
+
+manifest:
+  name: swe-review
+  version: 1.0.0
+  description: Agentic code review (Generate-Review-Revise-Verify loop)
+  license: MIT
+
+discovery_paths:
+  claude_code:
+    - "~/.claude/skills/**/SKILL.md  (copied here by install.sh)"
+    - ".claude/skills/**/SKILL.md   (project-local, loaded on trust)"
+  opencode:
+    - "~/.claude/skills/**/SKILL.md  (auto-loaded; install.sh copies here)"
+  cursor:
+    - "(no native skill loader — invoke via `swe-review review`/`loop` CLI which uses CursorAdapter)"
+  pi:
+    - "~/.pi/agent/skills/**/SKILL.md"
+    - "~/.pi/agent/skills/swe-review/swe-review-*/SKILL.md  (copied by PiAdapter.install_skills)"
+
+# Run `./install.sh install` to populate the paths above.
+
+skills:
+  - name: swe-review-review
+    file: .claude/skills/swe-review-review/SKILL.md
+    entry_point: swe_review:ReviewSkill
+  - name: swe-review-revise
+    file: .claude/skills/swe-review-revise/SKILL.md
+    entry_point: swe_review:ReviseSkill
+  - name: swe-review-explore
+    file: .claude/skills/swe-review-explore/SKILL.md
+    entry_point: swe_review:ExploreSkill
+  - name: swe-review-verify
+    file: .claude/skills/swe-review-verify/SKILL.md
+    entry_point: swe_review:VerifySkill
+  - name: swe-review-generate
+    file: .claude/skills/swe-review-generate/SKILL.md
+    entry_point: swe_review:GenerateSkill
+  - name: swe-review-analyze
+    file: .claude/skills/swe-review-analyze/SKILL.md
+    entry_point: swe_review:AnalyzeSkill
+  - name: swe-review-loop
+    file: .claude/skills/swe-review-loop/SKILL.md
+    entry_point: swe_review:LoopSkill
+
+subagents:
+  - name: reviewer
+    file: swe_review.subagents.reviewer_agent:ReviewerSubAgent
+    capabilities: [analyze_diff, explore_repository, generate_report, decision_making]
+  - name: reviser
+    file: swe_review.subagents.reviser_agent:ReviserSubAgent
+    capabilities: [parse_feedback, generate_fix, validate_diff]
+  - name: explorer
+    file: swe_review.subagents.explorer_agent:ExplorerSubAgent
+    capabilities: [file_search, code_analysis, dependency_tracking, test_discovery]
+  - name: verifier
+    file: swe_review.subagents.verifier_agent:VerifierSubAgent
+    capabilities: [run_tests, compare_patches, verify_resolution, sandbox_apply]
+  - name: generator
+    file: swe_review.subagents.generator_agent:GeneratorSubAgent
+    capabilities: [generate_patch, diff_formatting]
+  - name: analyzer
+    file: swe_review.subagents.analyzer_agent:AnalyzerSubAgent
+    capabilities: [static_diff_analysis, api_surface_check, complexity_estimate]
+  - name: loop
+    file: swe_review.subagents.loop_agent:LoopSubAgent
+    capabilities: [orchestrate_loop, track_iterations, early_stopping, best_of_n, review_guided]
+
+adapters:
+  - name: claude_code
+    class: swe_review.tools.claude_code_adapter:ClaudeCodeAdapter
+    cli: claude
+    headless_flag: "-p"
+  - name: cursor
+    class: swe_review.tools.cursor_adapter:CursorAdapter
+    cli: agent
+    headless_flag: "--print --trust"
+  - name: opencode
+    class: swe_review.tools.opencode_adapter:OpenCodeAdapter
+    cli: opencode
+    headless_flag: "run"
+  - name: pi
+    class: swe_review.tools.pi_adapter:PiAdapter
+    cli: pi
+    headless_flag: "--mode print"
+    auto_installs_skills: true
+    skills_root: ~/.pi/agent/skills/swe-review
+  - name: shell
+    class: swe_review.tools.shell_tools:ShellTools
+    note: "No LLM — placeholder for offline tests."
+
+invariants:
+  no_golden_patch_to_reviewer: true
+  no_hidden_test_to_reviewer: true
+  verifier_sandbox_default: true
+  diff_must_apply: true

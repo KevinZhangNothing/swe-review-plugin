@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swe-review"
+version = "1.0.0"
+description = "Agentic Code Review — close the loop on AI-generated PRs (Generate-Review-Revise-Verify)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "SWE-Review Team" }]
+keywords = ["agentic", "code-review", "swe", "claude-code", "cursor", "opencode", "pi"]
+dependencies = [
+    "pydantic>=2.5.0",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "loguru>=0.7",
+]
+
+[project.optional-dependencies]
+claude = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+http = ["aiohttp>=3.9", "requests>=2.31"]
+vcs = ["gitpython>=3.1"]
+
+[project.scripts]
+swe-review = "swe_review.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["swe_review*"]
+
+[tool.setuptools.package-data]
+swe_review = ["py.typed"]
