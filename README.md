@@ -89,7 +89,7 @@ flowchart LR
     end
 
     subgraph Output["📤 输出"]
-        O1[ReviewReport<br/><i>decision + defects[]</i>]
+        O1["ReviewReport<br/><i>decision + defects list</i>"]
         O2[RevisedPR<br/><i>新 diff</i>]
         O3[VerificationResult<br/><i>pass/fail + 测试结果</i>]
         O4[LoopResult<br/><i>迭代记录 + token 用量</i>]
@@ -140,7 +140,7 @@ flowchart TB
     PASSED -->|Yes| SUCCESS([✅ APPROVED])
     PASSED -->|No| MAX2
 
-    MAX2 -->|No| REVISE[ReviserSubAgent<br/><i>LLM 按 defects[] 修订</i>]
+    MAX2 -->|No| REVISE["ReviserSubAgent<br/><i>LLM 按 defects list 修订</i>"]
     MAX2 -->|Yes| FAIL([❌ REJECTED<br/>max iterations])
 
     REVISE --> REVISED{新 diff 有效?}
