@@ -66,7 +66,7 @@ flowchart TB
     CLI --> Skills
     SK --> Skills
     Skills --> SubAgents
-    SubAgents -.->|chat(system, user)| Adapters
+    SubAgents -.->|chat / call LLM| Adapters
 ```
 
 ### 数据流
@@ -328,8 +328,8 @@ classDiagram
 
     LoopResult *-- LoopIteration
     ReviewReport *-- Defect
-    ReviewResult ..> ExplorationResult : depends on
-    ReviewResult ..> AnalyzerResult : depends on
+    ReviewReport ..> ExplorationResult : depends on
+    ReviewReport ..> AnalyzerResult : depends on
 ```
 
 ---
