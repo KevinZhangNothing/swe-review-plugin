@@ -263,7 +263,7 @@ classDiagram
 
     class LoopIteration {
         +int iteration
-        +str phase              # generate|review|revise|verify
+        +str phase
         +str decision
         +float confidence
         +int defects_count
@@ -273,34 +273,34 @@ classDiagram
     }
 
     class ReviewReport {
-        +str decision            # approve|request_changes
+        +str decision
         +float confidence
-        +Dict summary            # {problem, solution, overall_assessment}
+        +Dict summary
         +List~Defect~ defects
         +str raw_response
         +str timestamp
         +Dict token_usage
         +int exploration_steps
-        +str prompt_style        # concise|detailed
+        +str prompt_style
     }
 
     class Defect {
-        +str severity            # high|medium|low
+        +str severity
         +str description
-        +Any location            # "path:line" (flat) | {path,start,end} (deep)
+        +Any location
         +str suggestion
-        +str category            # correctness|compatibility|security|...
+        +str category
     }
 
     class VerificationResult {
         +bool passed
         +List~Dict~ test_results
-        +str resolution_status   # resolved|not_resolved|partial|unknown
+        +str resolution_status
         +float confidence
         +str details
         +bool patch_applied
         +bool sandbox_used
-        +float oracle_similarity  # 仅评测模式
+        +float oracle_similarity
     }
 
     class ExplorationResult {
