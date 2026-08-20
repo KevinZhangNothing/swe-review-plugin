@@ -75,6 +75,19 @@ class PiAdapter:
             if not (skill_path / "SKILL.md").exists():
                 continue
             dest = target / skill_path.name
+            if dest.is_symlink():
+                # Symlink layout (repo as source of truth): NEVER copy into a
+                # live link — that writes through it into the repo and nests.
+                # Only repoint stale links.
+                try:
+                    stale = Path(os.readlink(str(dest))).resolve() != skill_path.resolve()
+                except OSError:
+                    stale = True
+                if stale:
+                    dest.unlink()
+                    dest.symlink_to(skill_path)
+                installed[skill_path.name] = str(dest)
+                continue
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(skill_path, dest)

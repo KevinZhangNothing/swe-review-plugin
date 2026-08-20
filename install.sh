@@ -26,6 +26,13 @@ ok()  { echo -e "${GREEN}[ok]${NC} $*"; }
 warn(){ echo -e "${YELLOW}[warn]${NC} $*"; }
 err() { echo -e "${RED}[err]${NC} $*"; }
 
+# 安全软链：BSD ln 在目标是“指向目录的软链”时会把新链接建进目标目录内部
+# （造成 repo .claude/skills 循环嵌套）。-h 把软链目标当文件处理、-f 强制替换；
+# 若目标仍是真实目录等 ln 无法处理的情形，回退到 rm -rf + ln -s。
+safe_symlink() {
+    ln -shf "$1" "$2" 2>/dev/null || { rm -rf "$2" && ln -s "$1" "$2"; }
+}
+
 PY=""
 detect_python() {
     if [ -n "$PY" ]; then return; fi
@@ -81,9 +88,8 @@ EOF
         for skill_dir in "$SKILLS_SRC"/swe-review-*; do
             [ -d "$skill_dir" ] || continue
             name="$(basename "$skill_dir")"
-            rm -rf "$HOME/.agents/skills/$name" "$HOME/.claude/skills/$name"
-            ln -s "$skill_dir" "$HOME/.agents/skills/$name"
-            ln -s "$skill_dir" "$HOME/.claude/skills/$name"
+            safe_symlink "$skill_dir" "$HOME/.agents/skills/$name"
+            safe_symlink "$skill_dir" "$HOME/.claude/skills/$name"
         done
         ok "已软链到 ~/.agents/skills/ 与 ~/.claude/skills/（编辑 repo 即时生效）"
     fi
@@ -95,8 +101,7 @@ EOF
         for skill_dir in "$SKILLS_SRC"/swe-review-*; do
             [ -d "$skill_dir" ] || continue
             name="$(basename "$skill_dir")"
-            rm -rf "$PI_DIR/$name"
-            ln -s "$skill_dir" "$PI_DIR/$name"
+            safe_symlink "$skill_dir" "$PI_DIR/$name"
         done
         ok "已软链到 $PI_DIR/"
     fi
