@@ -74,24 +74,31 @@ EOF
         ok ".env.local 已创建"
     fi
 
-    log "复制 SKILL.md → ~/.claude/skills/   (Claude Code + OpenCode 自动发现)"
-    mkdir -p "$HOME/.claude/skills"
-    if [ -d ".claude/skills" ]; then
-        cp -R .claude/skills/. "$HOME/.claude/skills/" 2>/dev/null || true
-        ok "已复制到 ~/.claude/skills/"
+    log "软链 SKILL.md → ~/.agents/skills/ + ~/.claude/skills/   (repo 为唯一 source of truth)"
+    SKILLS_SRC="$ROOT/.claude/skills"
+    mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills"
+    if [ -d "$SKILLS_SRC" ]; then
+        for skill_dir in "$SKILLS_SRC"/swe-review-*; do
+            [ -d "$skill_dir" ] || continue
+            name="$(basename "$skill_dir")"
+            rm -rf "$HOME/.agents/skills/$name" "$HOME/.claude/skills/$name"
+            ln -s "$skill_dir" "$HOME/.agents/skills/$name"
+            ln -s "$skill_dir" "$HOME/.claude/skills/$name"
+        done
+        ok "已软链到 ~/.agents/skills/ 与 ~/.claude/skills/（编辑 repo 即时生效）"
     fi
 
-    log "复制 SKILL.md → ~/.pi/agent/skills/swe-review/   (Pi 自动发现)"
+    log "软链 SKILL.md → ~/.pi/agent/skills/swe-review/   (Pi 自动发现)"
     PI_DIR="$HOME/.pi/agent/skills/swe-review"
     mkdir -p "$PI_DIR"
-    if [ -d ".claude/skills" ]; then
-        for skill_dir in .claude/skills/swe-review-*; do
+    if [ -d "$SKILLS_SRC" ]; then
+        for skill_dir in "$SKILLS_SRC"/swe-review-*; do
             [ -d "$skill_dir" ] || continue
             name="$(basename "$skill_dir")"
             rm -rf "$PI_DIR/$name"
-            cp -R "$skill_dir" "$PI_DIR/$name"
+            ln -s "$skill_dir" "$PI_DIR/$name"
         done
-        ok "已复制到 $PI_DIR/"
+        ok "已软链到 $PI_DIR/"
     fi
 
     log "检测 AI 工具 CLI"
@@ -111,10 +118,11 @@ ${GREEN}✔ 安装完成${NC}
   source .env.local
   swe-review list-tools
   swe-review health
-  swe-review review --issue "Bug" --pr-diff ./x.diff --tool pi [--prompt-style detailed] [--deep]
+  swe-review review --issue "Bug" --pr-diff ./x.diff --tool pi [--prompt-style engineering|concise|detailed] [--deep]
   swe-review loop    --issue "Bug" --repo-path . --strategy hybrid --tool pi [--feedback-level full_feedback] [--deep] 
 
-Skill 已注册到：
+Skill 已软链到（repo .claude/skills/ 为唯一 source of truth）：
+  - ~/.agents/skills/swe-review-*/          (通用发现路径)
   - ~/.claude/skills/swe-review-*/          (Claude Code / OpenCode)
   - ~/.pi/agent/skills/swe-review/swe-review-*/  (Pi)
 
@@ -133,6 +141,9 @@ cmd_uninstall() {
 
     # 包 uninstall 后本地 egg-info 还要手动清
     rm -rf swe_review.egg-info 2>/dev/null || true
+
+    log "从 ~/.agents/skills/ 移除 swe-review-*（软链，不伤 repo）"
+    rm -rf "$HOME/.agents/skills"/swe-review-* 2>/dev/null || true
 
     log "从 ~/.claude/skills/ 移除 swe-review-*"
     if [ -d "$HOME/.claude/skills" ]; then
