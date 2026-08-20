@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 
-from .reviewer_agent import DECISION_APPROVING, DECISION_REJECTING
+from .reviewer_agent import DECISION_APPROVING
 
 
 @dataclass
@@ -180,7 +180,8 @@ class LoopSubAgent:
             # 3) revise
             if not self.revise_skill:
                 break
-            new_pr = await self._revise(issue, current_pr, rev.get("defects", []), repo_path)
+            new_pr = await self._revise(issue, current_pr, rev.get("defects", []), repo_path,
+                                        decision=rev.get("decision", "request_changes"))
             if not new_pr or not new_pr.get("diff"):
                 iterations.append(self._mk_iter(i, "revise", "failed", 0.0, 0, notes="empty diff"))
                 break
@@ -332,6 +333,7 @@ class LoopSubAgent:
         repo_path: Optional[str],
         prompt_style: Optional[str] = None,
         feedback_level: Optional[str] = None,
+        decision: str = "request_changes",
     ) -> Optional[Dict[str, Any]]:
         if not self.revise_skill:
             return None
@@ -340,7 +342,7 @@ class LoopSubAgent:
             original_pr_title=pr.get("title", ""),
             original_pr_body=pr.get("body", ""),
             original_pr_diff=pr.get("diff", ""),
-            review_report={"defects": defects, "decision": "request_changes"},
+            review_report={"defects": defects, "decision": decision},
             repo_path=repo_path,
             prompt_style=prompt_style,
             feedback_level=feedback_level,

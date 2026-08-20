@@ -271,6 +271,49 @@ def test_engineering_hard_gate_forces_block():
     assert r.decision == "block"  # …but hard gate wins
 
 
+def test_engineering_p0_finding_forces_block():
+    """Prompt rule: P0 must block merge — enforced even if the model says APPROVE."""
+    import copy
+    payload = copy.deepcopy(ENGINEERING_PAYLOAD)
+    payload["decision"] = "APPROVE"
+    payload["hard_gate"] = {"triggered": False, "reason": ""}
+    payload["findings"][0]["severity"] = "P0"
+    r = _parse_engineering_payload(payload, None)
+    assert r.decision == "block"
+
+
+def test_engineering_p1_downgrades_approving_decision():
+    """Prompt rule: one or more P1 ⇒ REQUEST_CHANGES, for any approving decision."""
+    import copy
+    for approving in ("APPROVE", "APPROVE_WITH_SUGGESTIONS"):
+        payload = copy.deepcopy(ENGINEERING_PAYLOAD)
+        payload["decision"] = approving
+        r = _parse_engineering_payload(payload, None)
+        assert r.decision == "request_changes", approving
+    # non-approving decisions are left alone (block stays block)
+    payload = copy.deepcopy(ENGINEERING_PAYLOAD)
+    payload["decision"] = "BLOCK"
+    assert _parse_engineering_payload(payload, None).decision == "block"
+
+
+def test_finding_to_defect_carries_impact_and_evidence():
+    """The revise chain must receive evidence-rich feedback, not a weakened copy."""
+    f = Finding(
+        severity="P1", title="职责耦合",
+        location="a/b.py:10",
+        observation="一个方法做三件事",
+        why_it_matters="修改状态规则会连带影响缓存与事件分发",
+        evidence="calculateState() / saveCache() / notifyListeners()",
+        recommendation="拆分纯计算与副作用",
+    )
+    d = f.to_defect()
+    assert d.severity == "high"
+    assert "一个方法做三件事" in d.description
+    assert "[impact: 修改状态规则会连带影响缓存与事件分发]" in d.description
+    assert "[evidence: calculateState() / saveCache() / notifyListeners()]" in d.description
+    assert d.suggestion == "拆分纯计算与副作用"
+
+
 def test_engineering_decision_normalization():
     assert _normalize_decision("APPROVE") == "approve"
     assert _normalize_decision("approve_with_suggestions") == "approve_with_suggestions"
@@ -353,3 +396,46 @@ def test_loop_approves_with_suggestions(sample_diff):
     result = asyncio.run(loop.execute({"issue": "x", "initial_pr": {"diff": sample_diff}}))
     assert result.success is True
     assert result.final_decision == "approve_with_suggestions"
+
+
+def test_loop_passes_real_decision_to_reviser(sample_diff):
+    """_revise must forward the actual review decision (e.g. block), not a
+    hardcoded request_changes."""
+    import asyncio
+
+    class FakeReviewSkill:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, **kwargs):
+            self.calls += 1
+            decision = "block" if self.calls == 1 else "approve"
+
+            class Out:
+                def to_dict(self_inner, deep=False):
+                    return {
+                        "decision": decision,
+                        "confidence": 0.8,
+                        "defects": [{"severity": "high", "description": "d",
+                                     "location": "a.py:1", "suggestion": "s"}],
+                        "findings": [],
+                        "token_usage": None,
+                    }
+            return Out()
+
+    class FakeReviseSkill:
+        def __init__(self):
+            self.captured = None
+
+        async def execute(self, **kwargs):
+            self.captured = kwargs
+            return {"title": "t", "body": "b", "diff": sample_diff,
+                    "changes_summary": "fixed"}
+
+    revise = FakeReviseSkill()
+    loop = LoopSubAgent(review_skill=FakeReviewSkill(), revise_skill=revise,
+                        max_iterations=3)
+    result = asyncio.run(loop.execute({"issue": "x", "initial_pr": {"diff": sample_diff}}))
+    assert result.success is True
+    assert revise.captured is not None
+    assert revise.captured["review_report"]["decision"] == "block"

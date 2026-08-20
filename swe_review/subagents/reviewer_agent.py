@@ -118,10 +118,19 @@ class Finding:
         }
 
     def to_defect(self) -> "Defect":
-        """Map onto the legacy Defect shape for downstream revise/loop consumers."""
+        """Map onto the legacy Defect shape for downstream revise/loop consumers.
+
+        Carries why_it_matters / evidence into the description so the reviser
+        still receives evidence-rich feedback (the whole point of routing
+        engineering reviews to the detailed revision prompt).
+        """
         description = self.title
         if self.observation:
             description += f" — {self.observation}"
+        if self.why_it_matters:
+            description += f" [impact: {self.why_it_matters}]"
+        if self.evidence:
+            description += f" [evidence: {self.evidence}]"
         return Defect(
             severity=FINDING_TO_DEFECT_SEVERITY.get(self.severity, "medium"),
             description=description,
@@ -822,9 +831,16 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
     hard_gate.setdefault("triggered", False)
     hard_gate.setdefault("reason", "")
 
-    # Consistency guard: hard gate ⇒ block, regardless of the emitted decision.
-    if hard_gate.get("triggered"):
+    # Consistency guards: enforce the prompt's own decision rules even when the
+    # model output is internally inconsistent.
+    #   - hard gate triggered          ⇒ block
+    #   - any P0 finding present       ⇒ block   (P0 must block merge)
+    #   - any P1 finding + approving   ⇒ request_changes
+    severities = {f.severity for f in findings}
+    if hard_gate.get("triggered") or "P0" in severities:
         decision = "block"
+    elif "P1" in severities and decision in DECISION_APPROVING:
+        decision = "request_changes"
 
     defects = [f.to_defect() for f in findings]
 
