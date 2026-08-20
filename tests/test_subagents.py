@@ -439,3 +439,79 @@ def test_loop_passes_real_decision_to_reviser(sample_diff):
     assert result.success is True
     assert revise.captured is not None
     assert revise.captured["review_report"]["decision"] == "block"
+
+
+# ---------------------------------------------------------------------------
+# Lenient JSON parsing + one-shot LLM repair round
+# ---------------------------------------------------------------------------
+
+def test_best_effort_json_direct_brace_span_and_garbage():
+    from swe_review.subagents.reviewer_agent import _best_effort_json
+    assert _best_effort_json('{"a": 1}') == {"a": 1}
+    assert _best_effort_json('noise before {"a": 1} noise after') == {"a": 1}
+    assert _best_effort_json("") is None
+    assert _best_effort_json("not json at all") is None
+
+
+def test_best_effort_json_truncation_repair():
+    import json as _json
+    from swe_review.subagents.reviewer_agent import _best_effort_json
+    full = _json.dumps(ENGINEERING_PAYLOAD, ensure_ascii=False)
+    truncated = full[: len(full) - 200]  # cut into the tail
+    obj = _best_effort_json(truncated)
+    assert obj is not None
+    assert obj.get("decision") == "REQUEST_CHANGES"
+    # the leading findings survive the truncation repair
+    assert len(obj.get("findings", [])) >= 1
+
+
+def test_execute_repairs_malformed_json_with_one_retry():
+    """Broken JSON on first call ⇒ exactly one LLM repair round; merged tokens."""
+    import asyncio, json as _json
+
+    class StubAdapter:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, system, user, max_tokens=4096, temperature=0.1):
+            self.calls.append({"system": system, "user": user})
+            if len(self.calls) == 1:
+                # missing comma — deterministic heuristics cannot fix this
+                return '{"decision": "APPROVE" "confidence": 0.9}', \
+                    {"prompt_tokens": 3, "completion_tokens": 2}
+            return _json.dumps({"decision": "APPROVE", "confidence": 0.9,
+                                "summary": {}, "findings": []}), \
+                {"prompt_tokens": 4, "completion_tokens": 5}
+
+    adapter = StubAdapter()
+    sub = ReviewerSubAgent(tool_adapter=adapter, prompt_style="engineering")
+    report = asyncio.run(sub.execute({
+        "issue": "x", "pr_title": "t", "pr_diff": "diff --git a/a b/a\n",
+    }))
+    assert report.parse_error is None
+    assert report.decision == "approve"
+    assert len(adapter.calls) == 2  # exactly one repair round
+    assert "malformed JSON" in adapter.calls[1]["system"]
+    assert report.token_usage == {"prompt_tokens": 7, "completion_tokens": 7}
+
+
+def test_parse_error_surfaced_when_unrepairable():
+    import asyncio
+
+    class GarbageAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat(self, system, user, max_tokens=4096, temperature=0.1):
+            self.calls += 1
+            return "definitely not json {{{", {"prompt_tokens": 1, "completion_tokens": 1}
+
+    adapter = GarbageAdapter()
+    sub = ReviewerSubAgent(tool_adapter=adapter, prompt_style="engineering")
+    report = asyncio.run(sub.execute({
+        "issue": "x", "pr_title": "t", "pr_diff": "diff --git a/a b/a\n",
+    }))
+    assert report.parse_error is not None
+    assert report.decision == "request_changes"
+    assert adapter.calls == 2  # one repair attempt, then give up
+    assert report.to_dict()["parse_error"] is not None

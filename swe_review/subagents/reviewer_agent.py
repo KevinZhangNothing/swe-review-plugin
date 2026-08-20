@@ -151,6 +151,7 @@ class ReviewReport:
     scores: Dict[str, Any] = field(default_factory=dict)        # engineering style
     total_score: Optional[float] = None                         # engineering style
     hard_gate: Dict[str, Any] = field(default_factory=dict)     # engineering style
+    parse_error: Optional[str] = None  # set when the model output was not parseable
     raw_response: str = ""
     timestamp: str = ""
     token_usage: Optional[Dict[str, int]] = None
@@ -208,6 +209,7 @@ class ReviewReport:
             "scores": self.scores,
             "total_score": self.total_score,
             "hard_gate": self.hard_gate,
+            "parse_error": self.parse_error,
             "timestamp": self.timestamp,
             "token_usage": self.token_usage,
             "exploration_steps": self.exploration_steps,
@@ -583,6 +585,22 @@ class ReviewerSubAgent:
             system_prompt, user_prompt, max_tokens=max_tokens
         )
         report = self._parse_response(response, token_usage, prompt_style=prompt_style)
+        if report.parse_error and self.tool_adapter:
+            # One repair round for malformed model JSON (unescaped quotes, missing
+            # commas, truncation the deterministic heuristics could not fix).
+            # Bounded: exactly one extra call, no further retries.
+            repaired, extra_usage = await self._call_ai_tool(
+                _JSON_REPAIR_SYSTEM,
+                _json_repair_user(response, report.parse_error),
+                max_tokens=max_tokens,
+            )
+            token_usage = _merge_token_usage(token_usage, extra_usage)
+            retry_report = self._parse_response(
+                repaired, token_usage, prompt_style=prompt_style
+            )
+            if not retry_report.parse_error:
+                report = retry_report
+                response = repaired
         report.raw_response = response
         report.exploration_steps = exploration_steps
         return report
@@ -670,17 +688,17 @@ class ReviewerSubAgent:
         return "{}", {"prompt_tokens": 0, "completion_tokens": 0}
 
     def _parse_response(self, response, token_usage, prompt_style):
-        cleaned = _strip_fences(response)
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError as e:
+        data = _best_effort_json(_strip_fences(response))
+        if data is None or not isinstance(data, dict):
             return ReviewReport(
                 decision="request_changes",
                 confidence=0.5,
-                summary={"overall_assessment": f"Failed to parse response: {e}"},
+                summary={"overall_assessment": "Failed to parse model response as JSON"},
                 defects=[],
                 token_usage=token_usage,
                 prompt_style=prompt_style,
+                parse_error="not valid JSON" if isinstance(response, str) and response.strip()
+                            else "empty response",
             )
 
         if prompt_style == "engineering":
@@ -731,6 +749,130 @@ def _strip_fences(s: str) -> str:
     if s.endswith("```"):
         s = s[:-3]
     return s.strip()
+
+
+# ---------------------------------------------------------------------------
+# Lenient JSON loading — LLM output deviates from STRICT JSON often enough
+# (unescaped quotes inside strings, missing commas, truncated tails) that a
+# parse failure must not silently throw away an entire review.
+# ---------------------------------------------------------------------------
+
+def _best_effort_json(text: str) -> Optional[Any]:
+    """Parse JSON with fallbacks: direct load → brace-span extraction →
+    truncated-tail repair. Returns None when nothing works."""
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    candidates = [text]
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start:end + 1])
+    for cand in candidates:
+        try:
+            return json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+    for cand in reversed(candidates):
+        repaired = _repair_truncated_json(cand)
+        if repaired is not None:
+            return repaired
+    return None
+
+
+def _repair_truncated_json(text: str) -> Optional[Any]:
+    """Best-effort repair of truncated LLM JSON: close an unterminated string and
+    any open brackets; if the tail is a partial key/value, trim back to earlier
+    comma boundaries and try again (most-complete candidate first)."""
+    for candidate in _truncation_candidates(text):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _truncation_candidates(text: str):
+    """Yield candidate repairs for possibly-truncated JSON text."""
+    yield _close_json(text)
+    comma_positions = []
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == ",":
+            comma_positions.append(i)
+    for pos in reversed(comma_positions[-50:]):
+        yield _close_json(text[:pos])
+
+
+def _close_json(text: str) -> str:
+    """Close an unterminated string and any open brackets at end of text."""
+    stack: List[str] = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+    return text + ('"' if in_str else "") + "".join(reversed(stack))
+
+
+# ---------------------------------------------------------------------------
+# LLM JSON repair round (single retry, only when deterministic parsing fails)
+# ---------------------------------------------------------------------------
+
+_JSON_REPAIR_SYSTEM = (
+    "You repair malformed JSON emitted by another model. The user message "
+    "contains a review report that failed to parse. Output the SAME report as "
+    "ONE valid JSON object — no markdown fences, no commentary, no text "
+    "before/after. Preserve every field and value exactly; fix only the syntax "
+    "(escape embedded quotes, add missing commas/brackets, complete a truncated "
+    "tail without inventing new findings or scores)."
+)
+
+
+def _json_repair_user(raw_response: str, parse_error: str) -> str:
+    snippet = raw_response[:60_000]
+    return (
+        f"The following JSON failed to parse (error: {parse_error}).\n\n"
+        f"{snippet}\n\n"
+        "Output ONLY the corrected, valid JSON object."
+    )
+
+
+def _merge_token_usage(a: Optional[Dict[str, int]], b: Optional[Dict[str, int]]) -> Dict[str, int]:
+    merged: Dict[str, int] = {}
+    for usage in (a, b):
+        if not usage:
+            continue
+        for k, v in usage.items():
+            merged[k] = merged.get(k, 0) + (v or 0)
+    return merged
 
 
 def pick_enum(value: Any, choices: tuple, default: str) -> str:
