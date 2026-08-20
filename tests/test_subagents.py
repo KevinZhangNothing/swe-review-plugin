@@ -561,7 +561,9 @@ def test_execute_truncation_triggers_repair_round():
         "issue": "x", "pr_title": "t", "pr_diff": "diff --git a/a b/a\n",
     }))
     assert len(adapter.calls) == 2                       # repair round fired
-    assert report.truncated_repair is False              # final report is complete
+    # Trust follows content provenance: original output was truncated, so the
+    # final (repaired) report stays untrusted even though it parsed cleanly.
+    assert report.truncated_repair is True
     assert len(report.findings) == len(ENGINEERING_PAYLOAD["findings"])
 
 

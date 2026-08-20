@@ -586,6 +586,7 @@ class ReviewerSubAgent:
             system_prompt, user_prompt, max_tokens=max_tokens
         )
         report = self._parse_response(response, token_usage, prompt_style=prompt_style)
+        was_truncated = report.truncated_repair
         if (report.parse_error or report.truncated_repair) and self.tool_adapter:
             # One repair round for malformed model JSON (unescaped quotes, missing
             # commas) or truncation (repaired parse lost the tail — possibly
@@ -602,6 +603,12 @@ class ReviewerSubAgent:
             if not retry_report.parse_error and not retry_report.truncated_repair:
                 report = retry_report
                 response = repaired
+                if was_truncated:
+                    # Trust state follows content provenance, not parse method: the
+                    # repair round can close structure but cannot prove the lost
+                    # tail's findings were recovered. Keep the final report
+                    # untrusted so downstream gates (loop withhold-approve) hold.
+                    report.truncated_repair = True
             else:
                 # Repair round failed — keep the best parse we have, but do not
                 # lose the repair call's token cost.
