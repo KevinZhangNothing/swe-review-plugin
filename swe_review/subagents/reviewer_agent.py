@@ -15,10 +15,15 @@ Output schemas (two flavors selectable at serialization time):
   The nested form is convenient for downstream automated SFT / evaluation pipelines.
 
 Prompt styles:
-  - "concise"   (default) — practical daily use.
-  - "detailed"            — emphasizes Step 1→6 workflow + root-cause tracing
-                            + symptom-fix detection 4 rules (经验法则).
-                            Use for non-trivial PRs where blind approval is risky.
+  - "engineering" (default) — senior code-review agent: judges design quality,
+                            maintainability, consistency, simplicity, readability,
+                            testability, risk and change scope (8-dimension 100-point
+                            scoring + P0–P4 evidence-bound findings + 4-level decision
+                            APPROVE / APPROVE_WITH_SUGGESTIONS / REQUEST_CHANGES / BLOCK).
+                            Review target is the CHANGE, not the bug.
+  - "concise"             — legacy bug-fix-centric review, practical daily use.
+  - "detailed"            — legacy bug-fix-centric: Step 1→6 workflow + root-cause
+                            tracing + symptom-fix detection 4 rules (经验法则).
 """
 
 import json
@@ -29,6 +34,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from datetime import datetime
 
+from . import engineering_prompt
+
 
 # Defect severity & category enumerations
 DEFECT_SEVERITIES = ("high", "medium", "low")
@@ -36,6 +43,32 @@ DEFECT_CATEGORIES = (
     "correctness", "compatibility", "security",
     "performance", "maintainability",
 )
+
+# Engineering-style findings use P0-P4 severity (see Severity 定义 in the
+# engineering system prompt). Mapped onto legacy defect severities so that
+# downstream consumers (reviser / loop) keep working unchanged.
+FINDING_SEVERITIES = ("P0", "P1", "P2", "P3", "P4")
+FINDING_TO_DEFECT_SEVERITY = {
+    "P0": "high", "P1": "high", "P2": "medium", "P3": "low", "P4": "low",
+}
+
+# Decision vocabulary. Legacy styles emit approve/request_changes; engineering
+# style additionally distinguishes approve_with_suggestions and block.
+DECISION_APPROVING = ("approve", "approve_with_suggestions")
+DECISION_REJECTING = ("request_changes", "block")
+DECISION_CHOICES = DECISION_APPROVING + DECISION_REJECTING
+
+# Engineering scoring dimensions and their max points (total = 100).
+SCORE_DIMENSIONS = {
+    "design_quality": 20,
+    "maintainability": 15,
+    "consistency": 15,
+    "simplicity": 10,
+    "readability": 10,
+    "testability": 10,
+    "risk": 10,
+    "change_scope": 10,
+}
 
 
 @dataclass
@@ -54,17 +87,66 @@ class Defect:
 
 
 @dataclass
+class Finding:
+    """Engineering-style review finding (P0–P4, evidence-bound).
+
+    Fields mirror the review-framework requirement:
+    Location / Observation / Why It Matters / Evidence / Recommendation /
+    Severity / Confidence.
+    """
+    severity: str            # "P0".."P4"
+    title: str
+    location: Any            # str (flat) | {"path", "start_line", "end_line"} (deep)
+    observation: str = ""
+    why_it_matters: str = ""
+    evidence: str = ""
+    recommendation: str = ""
+    confidence: str = "medium"  # "high" | "medium" | "low"
+
+    def to_dict(self, deep: bool = False) -> Dict[str, Any]:
+        loc = (_normalize_location_deep(self.location) if deep
+               else _normalize_location_flat(self.location))
+        return {
+            "severity": self.severity,
+            "title": self.title,
+            "location": loc,
+            "observation": self.observation,
+            "why_it_matters": self.why_it_matters,
+            "evidence": self.evidence,
+            "recommendation": self.recommendation,
+            "confidence": self.confidence,
+        }
+
+    def to_defect(self) -> "Defect":
+        """Map onto the legacy Defect shape for downstream revise/loop consumers."""
+        description = self.title
+        if self.observation:
+            description += f" — {self.observation}"
+        return Defect(
+            severity=FINDING_TO_DEFECT_SEVERITY.get(self.severity, "medium"),
+            description=description,
+            location=self.location,
+            suggestion=self.recommendation,
+            category="maintainability" if self.severity in ("P2", "P3", "P4") else "correctness",
+        )
+
+
+@dataclass
 class ReviewReport:
     """审查报告数据结构"""
-    decision: str  # "approve" or "request_changes"  (flat)
+    decision: str  # "approve" | "approve_with_suggestions" | "request_changes" | "block"
     confidence: float
     summary: Dict[str, str] = field(default_factory=dict)
     defects: List[Defect] = field(default_factory=list)
+    findings: List[Finding] = field(default_factory=list)       # engineering style
+    scores: Dict[str, Any] = field(default_factory=dict)        # engineering style
+    total_score: Optional[float] = None                         # engineering style
+    hard_gate: Dict[str, Any] = field(default_factory=dict)     # engineering style
     raw_response: str = ""
     timestamp: str = ""
     token_usage: Optional[Dict[str, int]] = None
     exploration_steps: int = 0
-    prompt_style: str = "concise"  # "concise" | "detailed"
+    prompt_style: str = "engineering"  # "engineering" | "concise" | "detailed"
 
     def __post_init__(self):
         if not self.timestamp:
@@ -106,11 +188,17 @@ class ReviewReport:
                 for d in self.defects
             ]
 
+        findings_payload = [f.to_dict(deep=deep) for f in self.findings]
+
         return {
             "decision": decision,
             "confidence": self.confidence,
             "summary": self.summary,
             "defects": defects_payload,
+            "findings": findings_payload,
+            "scores": self.scores,
+            "total_score": self.total_score,
+            "hard_gate": self.hard_gate,
             "timestamp": self.timestamp,
             "token_usage": self.token_usage,
             "exploration_steps": self.exploration_steps,
@@ -153,16 +241,17 @@ def _normalize_location_deep(loc: Any) -> Dict[str, Any]:
                 "path": m.group(1),
                 "start_line": int(m.group(2)),
                 "end_line": int(m.group(3)) if m.group(3) else int(m.group(2)),
+                "function": None,
             }
-        return {"path": loc, "start_line": None, "end_line": None}
-    return {"path": str(loc), "start_line": None, "end_line": None}
+        return {"path": loc, "start_line": None, "end_line": None, "function": None}
+    return {"path": str(loc), "start_line": None, "end_line": None, "function": None}
 
 
 # ============================================================================
 # Prompts
 # ============================================================================
 
-PROMPT_STYLE_CHOICES = ("concise", "detailed")
+PROMPT_STYLE_CHOICES = ("engineering", "concise", "detailed")
 
 
 def _system_prompt_concise() -> str:
@@ -360,9 +449,10 @@ class ReviewerSubAgent:
     """审查 SubAgent — review a candidate PR and emit a structured JSON report.
 
     prompt_style:
-      - "concise"  (default): practical daily use.
-      - "detailed"           : emphasize Step 1→6 workflow + symptom-fix detection
-                               经验法则 (root-cause tracing, dependency checks, etc.).
+      - "engineering" (default): senior code-quality review (8 dimensions, P0-P4
+                                 findings, 4-level decision).
+      - "concise"              : legacy bug-fix-centric review.
+      - "detailed"             : legacy bug-fix-centric Step 1→6 workflow.
     """
 
     def __init__(
@@ -370,7 +460,7 @@ class ReviewerSubAgent:
         tool_adapter: Any = None,
         explorer: Any = None,
         config: Optional[Dict[str, Any]] = None,
-        prompt_style: str = "concise",
+        prompt_style: str = "engineering",
         explore_timeout: int = 180,
     ):
         if prompt_style not in PROMPT_STYLE_CHOICES:
@@ -415,6 +505,10 @@ class ReviewerSubAgent:
                 )
 
         prompt_style = context.get("prompt_style") or self.prompt_style
+        if prompt_style not in PROMPT_STYLE_CHOICES:
+            raise ValueError(
+                f"prompt_style must be one of {PROMPT_STYLE_CHOICES!r}, got {prompt_style!r}"
+            )
 
         issue = context.get("issue", "")
         pr_title = context.get("pr_title", "")
@@ -442,12 +536,18 @@ class ReviewerSubAgent:
         analysis = self._analyze_patch(pr_diff, repo_context)
 
         # 3) Prompts
-        system_prompt = (
-            _system_prompt_detailed()
-            if prompt_style == "detailed"
-            else _system_prompt_concise()
-        )
-        if prompt_style == "detailed":
+        if prompt_style == "engineering":
+            system_prompt = engineering_prompt.system_prompt()
+            user_prompt = engineering_prompt.user_prompt(
+                issue=issue,
+                pr_title=pr_title,
+                pr_body=pr_body,
+                pr_diff=pr_diff,
+                repo_context=repo_context,
+                analysis=analysis,
+            )
+        elif prompt_style == "detailed":
+            system_prompt = _system_prompt_detailed()
             user_prompt = _user_prompt_detailed(
                 issue=issue,
                 pr_title=pr_title,
@@ -457,6 +557,7 @@ class ReviewerSubAgent:
                 analysis=analysis,
             )
         else:
+            system_prompt = _system_prompt_concise()
             user_prompt = self._build_user_prompt_concise(
                 issue=issue,
                 pr_title=pr_title,
@@ -466,8 +567,12 @@ class ReviewerSubAgent:
                 analysis=analysis,
             )
 
-        # 4) AI call
-        response, token_usage = await self._call_ai_tool(system_prompt, user_prompt)
+        # 4) AI call — engineering reports (8 scored dimensions + findings) need
+        # more completion budget than the legacy bug-centric styles.
+        max_tokens = 8192 if prompt_style == "engineering" else 4096
+        response, token_usage = await self._call_ai_tool(
+            system_prompt, user_prompt, max_tokens=max_tokens
+        )
         report = self._parse_response(response, token_usage, prompt_style=prompt_style)
         report.raw_response = response
         report.exploration_steps = exploration_steps
@@ -546,11 +651,12 @@ class ReviewerSubAgent:
             "Output ONLY the JSON object."
         )
 
-    async def _call_ai_tool(self, system_prompt: str, user_prompt: str):
+    async def _call_ai_tool(self, system_prompt: str, user_prompt: str,
+                            max_tokens: int = 4096):
         if self.tool_adapter:
             return await self.tool_adapter.chat(
                 system=system_prompt, user=user_prompt,
-                max_tokens=4096, temperature=0.1,
+                max_tokens=max_tokens, temperature=0.1,
             )
         return "{}", {"prompt_tokens": 0, "completion_tokens": 0}
 
@@ -567,6 +673,9 @@ class ReviewerSubAgent:
                 token_usage=token_usage,
                 prompt_style=prompt_style,
             )
+
+        if prompt_style == "engineering":
+            return _parse_engineering_payload(data, token_usage)
 
         decision, confidence = _coerce_decision(data)
         defects_payload = data.get("defects", [])
@@ -622,7 +731,11 @@ def pick_enum(value: Any, choices: tuple, default: str) -> str:
 
 
 def _coerce_decision(data: Dict[str, Any]) -> tuple[str, float]:
-    """Accept BOTH flat and nested decision shapes; emit (flat decision, confidence)."""
+    """Accept BOTH flat and nested decision shapes; emit (flat decision, confidence).
+
+    Normalizes the full 4-level vocabulary (engineering style emits uppercase):
+    APPROVE / APPROVE_WITH_SUGGESTIONS / REQUEST_CHANGES / BLOCK.
+    """
     d = data.get("decision")
     if isinstance(d, dict):
         # nested `decision.recommendation`-style shape
@@ -639,5 +752,91 @@ def _coerce_decision(data: Dict[str, Any]) -> tuple[str, float]:
         conf = float(conf)
     except (TypeError, ValueError):
         conf = 0.5
-    rec = rec if rec in ("approve", "request_changes") else "request_changes"
+    rec = _normalize_decision(rec)
     return rec, conf
+
+
+def _normalize_decision(rec: Any) -> str:
+    """Map arbitrary decision spellings onto the canonical 4-value vocabulary."""
+    if not isinstance(rec, str):
+        return "request_changes"
+    key = rec.strip().upper().replace(" ", "_").replace("-", "_")
+    mapping = {
+        "APPROVE": "approve",
+        "APPROVE_WITH_SUGGESTIONS": "approve_with_suggestions",
+        "REQUEST_CHANGES": "request_changes",
+        "BLOCK": "block",
+    }
+    return mapping.get(key, "request_changes")
+
+
+def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewReport:
+    """Parse the engineering-style STRICT JSON payload (scores + P0-P4 findings).
+
+    Findings are additionally mapped onto legacy Defect objects so downstream
+    consumers (reviser / loop) keep working without schema changes.
+    """
+    decision, confidence = _coerce_decision(data)
+
+    findings: List[Finding] = []
+    for f in data.get("findings", []) or []:
+        if not isinstance(f, dict):
+            continue
+        sev = str(f.get("severity", "P2")).upper()
+        findings.append(Finding(
+            severity=pick_enum(sev, FINDING_SEVERITIES, "P2"),
+            title=str(f.get("title", "") or ""),
+            location=f.get("location", ""),
+            observation=str(f.get("observation", "") or ""),
+            why_it_matters=str(f.get("why_it_matters", "") or ""),
+            evidence=str(f.get("evidence", "") or ""),
+            recommendation=str(f.get("recommendation", "") or ""),
+            confidence=pick_enum(
+                str(f.get("confidence", "medium") or "medium").lower(),
+                ("high", "medium", "low"), "medium",
+            ),
+        ))
+
+    scores_raw = data.get("scores", {}) or {}
+    scores: Dict[str, Any] = {}
+    for dim, max_pts in SCORE_DIMENSIONS.items():
+        entry = scores_raw.get(dim, {})
+        if isinstance(entry, dict):
+            scores[dim] = {
+                "score": entry.get("score"),
+                "max": max_pts,
+                "reason": entry.get("reason", ""),
+            }
+        else:  # tolerate bare number
+            scores[dim] = {"score": entry, "max": max_pts, "reason": ""}
+
+    total_score = data.get("total_score")
+    try:
+        total_score = float(total_score) if total_score is not None else None
+    except (TypeError, ValueError):
+        total_score = None
+
+    hard_gate = data.get("hard_gate", {}) or {}
+    if not isinstance(hard_gate, dict):
+        hard_gate = {"triggered": bool(hard_gate), "reason": ""}
+    hard_gate.setdefault("triggered", False)
+    hard_gate.setdefault("reason", "")
+
+    # Consistency guard: hard gate ⇒ block, regardless of the emitted decision.
+    if hard_gate.get("triggered"):
+        decision = "block"
+
+    defects = [f.to_defect() for f in findings]
+
+    return ReviewReport(
+        decision=decision,
+        confidence=confidence,
+        summary=data.get("summary", {}) or {},
+        defects=defects,
+        findings=findings,
+        scores=scores,
+        total_score=total_score,
+        hard_gate=hard_gate,
+        token_usage=token_usage,
+        prompt_style="engineering",
+    )

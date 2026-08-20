@@ -205,10 +205,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_rev.add_argument("--tool", default="shell",
                        choices=["claude-code", "cursor", "opencode", "pi", "shell"])
     p_rev.add_argument("--max-steps", type=int, default=8)
-    p_rev.add_argument("--prompt-style", default="concise",
-                       choices=["concise", "detailed"],
-                       help="concise: practical daily use.  detailed: Step 1→6 "
-                            "workflow + symptom-fix detection rules.")
+    p_rev.add_argument("--prompt-style", default="engineering",
+                       choices=["engineering", "concise", "detailed"],
+                       help="engineering (default): senior code-quality review — "
+                            "8-dimension scoring + P0-P4 findings + 4-level decision. "
+                            "concise/detailed: legacy bug-fix-centric review.")
     p_rev.add_argument("--deep", action="store_true",
                        help="Emit the deep nested schema "
                             "(decision:{recommendation,confidence}, "
@@ -225,7 +226,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rvs.add_argument("--tool", default="shell",
                        choices=["claude-code", "cursor", "opencode", "pi", "shell"])
     p_rvs.add_argument("--prompt-style", default="concise",
-                       choices=["concise", "detailed"])
+                       choices=["engineering", "concise", "detailed"],
+                       help="engineering is routed to the detailed revision prompt.")
     p_rvs.add_argument("--feedback-level", default="full_feedback",
                        choices=["full_feedback", "minimal_feedback", "baseline"],
                        help="How much feedback the reviser is given.")
@@ -243,8 +245,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_loop.add_argument("--output-dir", default=None)
     p_loop.add_argument("--tool", default="shell",
                         choices=["claude-code", "cursor", "opencode", "pi", "shell"])
-    p_loop.add_argument("--prompt-style", default="concise",
-                        choices=["concise", "detailed"])
+    p_loop.add_argument("--prompt-style", default="engineering",
+                        choices=["engineering", "concise", "detailed"])
     p_loop.add_argument("--feedback-level", default="full_feedback",
                         choices=["full_feedback", "minimal_feedback", "baseline"])
     p_loop.add_argument("--deep", action="store_true",

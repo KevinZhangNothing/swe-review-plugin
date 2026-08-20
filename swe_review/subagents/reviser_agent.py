@@ -152,6 +152,11 @@ class ReviserSubAgent:
         prompt_style: str = "concise",
         feedback_level: str = "full_feedback",
     ):
+        # The reviser has no engineering-specific prompt; engineering-style
+        # review feedback (P0-P4 findings mapped to defects) is evidence-rich,
+        # so route it to the detailed revision prompt.
+        if prompt_style == "engineering":
+            prompt_style = "detailed"
         if prompt_style not in ("concise", "detailed"):
             raise ValueError(
                 f"prompt_style must be concise or detailed, got {prompt_style!r}"
@@ -189,6 +194,8 @@ class ReviserSubAgent:
 
         # Allow per-call overrides
         prompt_style = context.get("prompt_style") or self.prompt_style
+        if prompt_style == "engineering":
+            prompt_style = "detailed"
         feedback_level = context.get("feedback_level") or self.feedback_level
 
         if prompt_style == "detailed":

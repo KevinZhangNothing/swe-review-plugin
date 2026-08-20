@@ -18,6 +18,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 
+from .reviewer_agent import DECISION_APPROVING, DECISION_REJECTING
+
 
 @dataclass
 class LoopIteration:
@@ -152,7 +154,7 @@ class LoopSubAgent:
                                             token_usage=rev.get("token_usage")))
             self._accum_tokens(token_total, rev.get("token_usage"))
 
-            if rev.get("decision") == "approve":
+            if rev.get("decision") in DECISION_APPROVING:
                 # 如有 verifier，跑一次验证作为 RRR 信号
                 rr = await self._verify(current_pr, repo_path)
                 if rr:
@@ -161,7 +163,7 @@ class LoopSubAgent:
                                                     rr["confidence"], 0, notes=rr["details"]))
                 return LoopResult(
                     success=True,
-                    final_decision="approve",
+                    final_decision=rev.get("decision", "approve"),
                     final_pr_diff=current_pr.get("diff", ""),
                     total_iterations=len(iterations),
                     iterations=iterations,
@@ -241,14 +243,14 @@ class LoopSubAgent:
                                             rev.get("confidence", 0.5), len(rev.get("defects", [])),
                                             token_usage=rev.get("token_usage")))
             self._accum_tokens(token_total, rev.get("token_usage"))
-            if rev.get("decision") == "approve":
+            if rev.get("decision") in DECISION_APPROVING:
                 rr = await self._verify(cand, repo_path)
                 if rr:
                     iterations.append(self._mk_iter(k, "verify",
                                                     "approve" if rr["passed"] else "review_failed",
                                                     rr["confidence"], 0, notes=rr["details"]))
                 return LoopResult(
-                    success=True, final_decision="approve",
+                    success=True, final_decision=rev.get("decision", "approve"),
                     final_pr_diff=cand.get("diff", ""),
                     total_iterations=len(iterations),
                     iterations=iterations,

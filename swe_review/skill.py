@@ -11,7 +11,9 @@ import asyncio
 from typing import Dict, Any, Optional, List, Callable, Awaitable
 from dataclasses import dataclass, asdict
 
-from .subagents.reviewer_agent import ReviewerSubAgent, ReviewReport
+from .subagents.reviewer_agent import (
+    ReviewerSubAgent, ReviewReport, DECISION_CHOICES,
+)
 from .subagents.reviser_agent import ReviserSubAgent, RevisedPR
 from .subagents.explorer_agent import ExplorerSubAgent, ExplorationResult
 from .subagents.verifier_agent import VerifierSubAgent, VerificationResult
@@ -91,15 +93,18 @@ class ReviewSkill:
     默认会先把任务交给 ExploreSkill 收集上下文，再喂给 ReviewerSubAgent。
 
     prompt_style:
-      - "concise"           (default): 实用 prompt
-      - "detailed"           : Step 1→6 workflow + symptom-fix detection rules (root-cause-first)
+      - "engineering" (default): senior code-quality review — 8 维度 100 分制评分、
+                                 P0–P4 findings、4 档决策（APPROVE /
+                                 APPROVE_WITH_SUGGESTIONS / REQUEST_CHANGES / BLOCK）
+      - "concise"          : legacy bug-fix-centric 实用 prompt
+      - "detailed"         : legacy Step 1→6 workflow + symptom-fix detection (root-cause-first)
     """
 
     name = "review"
 
     def __init__(self, tool_adapter=None, explore_skill: Optional[ExploreSkill] = None,
                  analyze_skill: Optional[AnalyzeSkill] = None,
-                 prompt_style: str = "concise"):
+                 prompt_style: str = "engineering"):
         from .tools.base import BaseAdapter
         self.tool = tool_adapter or BaseAdapter()
         self.explore_skill = explore_skill or ExploreSkill()
@@ -136,7 +141,7 @@ class ReviewSkill:
         }
         report: ReviewReport = await self.subagent.execute(ctx)
         return SkillResult(
-            ok=(report.decision in ("approve", "request_changes")),
+            ok=(report.decision in DECISION_CHOICES),
             payload=report.to_dict(deep=deep),
             raw=report,
             message=f"reviewed (prompt_style={report.prompt_style}, deep={deep})",
@@ -275,7 +280,7 @@ class LoopSkill:
         strategy: str = "review_guided",
         n_best_of: int = 3,
         output_dir: Optional[str] = None,
-        prompt_style: str = "concise",
+        prompt_style: str = "engineering",
         revision_feedback_level: str = "full_feedback",
     ):
         self.prompt_style = prompt_style

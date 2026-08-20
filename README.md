@@ -133,8 +133,8 @@ flowchart TB
 
     REVIEW --> APPROVED{decision?}
 
-    APPROVED -->|approve| VERIFY[VerifierSubAgent<br/><i>sandbox + git apply + tests</i>]
-    APPROVED -->|request_changes| MAX2{i = max_iter?}
+    APPROVED -->|approve / approve_with_suggestions| VERIFY[VerifierSubAgent<br/><i>sandbox + git apply + tests</i>]
+    APPROVED -->|request_changes / block| MAX2{i = max_iter?}
 
     VERIFY --> PASSED{passed?}
     PASSED -->|Yes| SUCCESS([✅ APPROVED])
@@ -277,11 +277,26 @@ classDiagram
         +float confidence
         +Dict summary
         +List~Defect~ defects
+        +List~Finding~ findings
+        +Dict scores
+        +float total_score
+        +Dict hard_gate
         +str raw_response
         +str timestamp
         +Dict token_usage
         +int exploration_steps
         +str prompt_style
+    }
+
+    class Finding {
+        +str severity
+        +str title
+        +Any location
+        +str observation
+        +str why_it_matters
+        +str evidence
+        +str recommendation
+        +str confidence
     }
 
     class Defect {
@@ -461,6 +476,16 @@ flowchart LR
 | `VerifySkill` | 沙箱 apply + 测试 | `VerifierSubAgent` | — |
 | `LoopSkill` | 编排闭环 | `LoopSubAgent` | 上述全部 |
 
+#### Reviewer prompt styles（`prompt_style`）
+
+| style | 定位 |
+|---|---|
+| `engineering`（默认） | **高级代码审查**：审查对象是 Change 而非 Bug。8 维度 100 分制评分（Design 20 / Maintainability 15 / Consistency 15 / Simplicity 10 / Readability 10 / Testability 10 / Risk 10 / Change Scope 10）+ P0–P4 证据绑定 findings + Hard Gate + 4 档决策（APPROVE / APPROVE_WITH_SUGGESTIONS / REQUEST_CHANGES / BLOCK）。先理解再评价，Project Convention > Generic Best Practice，禁止低价值评论。 |
+| `concise` | legacy bug-fix-centric：判断 patch 是否修复 issue 根因。 |
+| `detailed` | legacy bug-fix-centric：Step 1→6 workflow + symptom-fix detection。 |
+
+engineering 报告同时把 findings 映射为 legacy `defects`（P0/P1→high，P2→medium，P3/P4→low），revise/loop 下游无需改动；`approve_with_suggestions` 与 `approve` 一样终止闭环为成功，`block`（Hard Gate / P0）与 `request_changes` 触发修订。
+
 ### 5.2 SubAgent 层（`swe_review/subagents/`）
 
 执行单元，全部有 `name / capabilities / get_status` 元信息。
@@ -526,7 +551,7 @@ swe-review health                                      # 每个 adapter 发一�
 swe-review install-skills [--source ...] [--pi-skills-dir ...]
 
 swe-review review    --issue ... --pr-diff ... \
-                     [--tool pi] [--prompt-style detailed] [--deep]
+                     [--tool pi] [--prompt-style engineering|concise|detailed] [--deep]
 
 swe-review revise    --issue ... --pr-diff ... \
                      --review-report ... [--feedback-level full_feedback]

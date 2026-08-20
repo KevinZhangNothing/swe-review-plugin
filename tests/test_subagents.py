@@ -2,7 +2,10 @@
 
 import pytest
 
-from swe_review.subagents.reviewer_agent import ReviewerSubAgent, ReviewReport, Defect
+from swe_review.subagents.reviewer_agent import (
+    ReviewerSubAgent, ReviewReport, Defect, Finding,
+    _parse_engineering_payload, _normalize_decision,
+)
 from swe_review.subagents.reviser_agent import ReviserSubAgent
 from swe_review.subagents.explorer_agent import ExplorerSubAgent
 from swe_review.subagents.verifier_agent import VerifierSubAgent
@@ -190,3 +193,163 @@ def test_defect_new_fields_serialize():
     assert "category" not in flat
     # deep schema DOES include category
     assert r.to_dict(deep=True)["defects"][0]["category"] == "security"
+
+
+# ---------------------------------------------------------------------------
+# Engineering prompt style (senior code-quality review)
+# ---------------------------------------------------------------------------
+
+ENGINEERING_PAYLOAD = {
+    "decision": "REQUEST_CHANGES",
+    "confidence": 0.9,
+    "summary": {
+        "problem": "重构设备状态计算逻辑",
+        "solution": "拆分 calculateState 并引入缓存写入",
+        "overall_assessment": "设计方向正确，但职责耦合明显",
+    },
+    "scores": {
+        "design_quality": {"score": 12, "max": 20, "reason": "职责耦合"},
+        "maintainability": {"score": 9, "max": 15, "reason": "高耦合"},
+        "consistency": {"score": 13, "max": 15, "reason": "符合项目分层"},
+        "simplicity": 7,
+        "readability": {"score": 8, "max": 10, "reason": "命名清晰"},
+        "testability": {"score": 5, "max": 10, "reason": "副作用难以 mock"},
+        "risk": {"score": 6, "max": 10, "reason": "状态来源分散"},
+        "change_scope": {"score": 9, "max": 10, "reason": "范围克制"},
+    },
+    "total_score": 69,
+    "hard_gate": {"triggered": False, "reason": ""},
+    "findings": [
+        {
+            "severity": "P1", "title": "状态计算与副作用耦合",
+            "location": "lib/device_manager.dart:120-145",
+            "observation": "同一方法负责状态计算、缓存写入与事件通知",
+            "why_it_matters": "未来修改状态规则会同时影响缓存与事件分发",
+            "evidence": "calculateState() / saveCache() / notifyListeners()",
+            "recommendation": "拆分纯计算与副作用",
+            "confidence": "High",
+        },
+        {
+            "severity": "P3", "title": "命名缩写",
+            "location": "lib/device_manager.dart:88",
+            "observation": "dm 变量名", "why_it_matters": "轻微",
+            "evidence": "var dm = ...", "recommendation": "可改为 deviceManager",
+            "confidence": "low",
+        },
+    ],
+}
+
+
+def test_engineering_payload_parse_and_defect_mapping():
+    r = _parse_engineering_payload(ENGINEERING_PAYLOAD, {"prompt_tokens": 10, "completion_tokens": 20})
+    d = r.to_dict()
+    assert d["decision"] == "request_changes"
+    assert d["prompt_style"] == "engineering"
+    assert d["total_score"] == 69.0
+    assert len(d["findings"]) == 2
+    # scores normalized: bare number tolerated, max re-asserted from schema
+    assert d["scores"]["simplicity"] == {"score": 7, "max": 10, "reason": ""}
+    assert d["scores"]["design_quality"]["max"] == 20
+    # findings mapped onto legacy defects for downstream revise compatibility
+    assert [x["severity"] for x in d["defects"]] == ["high", "low"]
+    assert d["defects"][0]["location"] == "lib/device_manager.dart:120-145"
+    # finding confidence normalized to lowercase enum
+    assert r.findings[0].confidence == "high"
+    # deep schema: location parsed into {path, start_line, end_line}
+    deep = r.to_dict(deep=True)
+    assert deep["findings"][0]["location"] == {
+        "path": "lib/device_manager.dart", "start_line": 120, "end_line": 145,
+        "function": None,
+    }
+
+
+def test_engineering_hard_gate_forces_block():
+    payload = dict(ENGINEERING_PAYLOAD)
+    payload["decision"] = "APPROVE"  # model says approve…
+    payload["hard_gate"] = {"triggered": True, "reason": "Critical Security Risk"}
+    r = _parse_engineering_payload(payload, None)
+    assert r.decision == "block"  # …but hard gate wins
+
+
+def test_engineering_decision_normalization():
+    assert _normalize_decision("APPROVE") == "approve"
+    assert _normalize_decision("approve_with_suggestions") == "approve_with_suggestions"
+    assert _normalize_decision("Approve With Suggestions") == "approve_with_suggestions"
+    assert _normalize_decision("BLOCK") == "block"
+    assert _normalize_decision("request-changes") == "request_changes"
+    assert _normalize_decision("lol") == "request_changes"
+    assert _normalize_decision(None) == "request_changes"
+
+
+def test_engineering_system_prompt_contract():
+    from swe_review.subagents import engineering_prompt
+    sp = engineering_prompt.system_prompt()
+    # framework pillars present
+    for marker in (
+        "Design Quality", "Maintainability", "Consistency", "Simplicity",
+        "Readability", "Testability", "Risk", "Change Scope",
+        "P0", "P4", "Hard Gate", "Project Convention",
+        "Over-engineering", "Under-engineering",
+        "APPROVE_WITH_SUGGESTIONS", "BLOCK",
+    ):
+        assert marker in sp, f"missing: {marker}"
+    # STRICT JSON output contract
+    assert '"total_score"' in sp and '"findings"' in sp and '"hard_gate"' in sp
+
+
+def test_reviewer_execute_engineering_end_to_end():
+    """ReviewerSubAgent(prompt_style='engineering') routes prompts and parses the
+    engineering JSON contract end-to-end via a stub tool adapter."""
+    import asyncio, json as _json
+
+    class StubAdapter:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, system, user, max_tokens=4096, temperature=0.1):
+            self.calls.append({"system": system, "user": user, "max_tokens": max_tokens})
+            return _json.dumps(ENGINEERING_PAYLOAD), {"prompt_tokens": 5, "completion_tokens": 7}
+
+    adapter = StubAdapter()
+    sub = ReviewerSubAgent(tool_adapter=adapter, prompt_style="engineering")
+    report = asyncio.run(sub.execute({
+        "issue": "重构设备状态模块",
+        "pr_title": "refactor: split device state",
+        "pr_diff": "diff --git a/lib/device_manager.dart b/lib/device_manager.dart\n"
+                   "@@ -1 +1,2 @@\n+x\n",
+    }))
+    assert report.prompt_style == "engineering"
+    assert report.decision == "request_changes"
+    assert report.total_score == 69.0
+    assert len(report.findings) == 2
+    # engineering reports get the larger completion budget
+    assert adapter.calls[0]["max_tokens"] == 8192
+    assert "Code Review Agent System Prompt" in adapter.calls[0]["system"]
+
+
+def test_reviser_maps_engineering_style_to_detailed():
+    sub = ReviserSubAgent(tool_adapter=None, prompt_style="engineering")
+    assert sub.prompt_style == "detailed"
+
+
+def test_loop_approves_with_suggestions(sample_diff):
+    """approve_with_suggestions must terminate the loop as a success."""
+    import asyncio
+
+    class FakeReviewSkill:
+        async def execute(self, **kwargs):
+            class Out:
+                def to_dict(self_inner, deep=False):
+                    return {
+                        "decision": "approve_with_suggestions",
+                        "confidence": 0.88,
+                        "defects": [],
+                        "findings": [],
+                        "token_usage": None,
+                    }
+            return Out()
+
+    loop = LoopSubAgent(review_skill=FakeReviewSkill(), max_iterations=3)
+    result = asyncio.run(loop.execute({"issue": "x", "initial_pr": {"diff": sample_diff}}))
+    assert result.success is True
+    assert result.final_decision == "approve_with_suggestions"
