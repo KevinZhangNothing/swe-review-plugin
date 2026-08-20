@@ -152,6 +152,7 @@ class ReviewReport:
     total_score: Optional[float] = None                         # engineering style
     hard_gate: Dict[str, Any] = field(default_factory=dict)     # engineering style
     parse_error: Optional[str] = None  # set when the model output was not parseable
+    truncated_repair: bool = False  # JSON only parsed via truncation repair (tail lost)
     raw_response: str = ""
     timestamp: str = ""
     token_usage: Optional[Dict[str, int]] = None
@@ -210,6 +211,7 @@ class ReviewReport:
             "total_score": self.total_score,
             "hard_gate": self.hard_gate,
             "parse_error": self.parse_error,
+            "truncated_repair": self.truncated_repair,
             "timestamp": self.timestamp,
             "token_usage": self.token_usage,
             "exploration_steps": self.exploration_steps,
@@ -585,22 +587,26 @@ class ReviewerSubAgent:
             system_prompt, user_prompt, max_tokens=max_tokens
         )
         report = self._parse_response(response, token_usage, prompt_style=prompt_style)
-        if report.parse_error and self.tool_adapter:
+        if (report.parse_error or report.truncated_repair) and self.tool_adapter:
             # One repair round for malformed model JSON (unescaped quotes, missing
-            # commas, truncation the deterministic heuristics could not fix).
-            # Bounded: exactly one extra call, no further retries.
+            # commas) or truncation (repaired parse lost the tail — possibly
+            # findings, possibly a P0). Bounded: exactly one extra call.
             repaired, extra_usage = await self._call_ai_tool(
                 _JSON_REPAIR_SYSTEM,
-                _json_repair_user(response, report.parse_error),
+                _json_repair_user(response, report.parse_error or "truncated JSON"),
                 max_tokens=max_tokens,
             )
             token_usage = _merge_token_usage(token_usage, extra_usage)
             retry_report = self._parse_response(
                 repaired, token_usage, prompt_style=prompt_style
             )
-            if not retry_report.parse_error:
+            if not retry_report.parse_error and not retry_report.truncated_repair:
                 report = retry_report
                 response = repaired
+            else:
+                # Repair round failed — keep the best parse we have, but do not
+                # lose the repair call's token cost.
+                report.token_usage = token_usage
         report.raw_response = response
         report.exploration_steps = exploration_steps
         return report
@@ -688,7 +694,7 @@ class ReviewerSubAgent:
         return "{}", {"prompt_tokens": 0, "completion_tokens": 0}
 
     def _parse_response(self, response, token_usage, prompt_style):
-        data = _best_effort_json(_strip_fences(response))
+        data, repaired = _best_effort_json(_strip_fences(response))
         if data is None or not isinstance(data, dict):
             return ReviewReport(
                 decision="request_changes",
@@ -702,8 +708,13 @@ class ReviewerSubAgent:
             )
 
         if prompt_style == "engineering":
-            return _parse_engineering_payload(data, token_usage)
+            report = _parse_engineering_payload(data, token_usage)
+        else:
+            report = self._parse_legacy_payload(data, token_usage, prompt_style)
+        report.truncated_repair = repaired
+        return report
 
+    def _parse_legacy_payload(self, data, token_usage, prompt_style):
         decision, confidence = _coerce_decision(data)
         defects_payload = data.get("defects", [])
         defects = [
@@ -757,28 +768,29 @@ def _strip_fences(s: str) -> str:
 # parse failure must not silently throw away an entire review.
 # ---------------------------------------------------------------------------
 
-def _best_effort_json(text: str) -> Optional[Any]:
+def _best_effort_json(text: str) -> tuple:
     """Parse JSON with fallbacks: direct load → brace-span extraction →
-    truncated-tail repair. Returns None when nothing works."""
+    truncated-tail repair. Returns (obj, repaired_via_truncation_heuristic);
+    (None, False) when nothing works."""
     if not isinstance(text, str):
-        return None
+        return None, False
     text = text.strip()
     if not text:
-        return None
+        return None, False
     candidates = [text]
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
         candidates.append(text[start:end + 1])
     for cand in candidates:
         try:
-            return json.loads(cand)
+            return json.loads(cand), False
         except json.JSONDecodeError:
             continue
     for cand in reversed(candidates):
         repaired = _repair_truncated_json(cand)
         if repaired is not None:
-            return repaired
-    return None
+            return repaired, True
+    return None, False
 
 
 def _repair_truncated_json(text: str) -> Optional[Any]:

@@ -105,13 +105,20 @@ class LoopSubAgent:
         max_iter = int(context.get("max_iterations", self.max_iterations))
         strategy = context.get("strategy", self.strategy)
         n_best = int(context.get("n_best_of", self.n_best_of))
+        prompt_style = context.get("prompt_style")
+        feedback_level = context.get("revision_feedback_level")
 
         if strategy == "best_of_n":
-            r = await self._run_best_of_n(issue, repo_path, n_best, t0)
+            r = await self._run_best_of_n(issue, repo_path, n_best, t0,
+                                          prompt_style=prompt_style)
         elif strategy == "hybrid":
-            r = await self._run_hybrid(issue, repo_path, initial_pr, n_best, t0)
+            r = await self._run_hybrid(issue, repo_path, initial_pr, n_best, t0,
+                                       prompt_style=prompt_style,
+                                       feedback_level=feedback_level)
         else:
-            r = await self._run_review_guided(issue, repo_path, initial_pr, max_iter, t0)
+            r = await self._run_review_guided(issue, repo_path, initial_pr, max_iter, t0,
+                                              prompt_style=prompt_style,
+                                              feedback_level=feedback_level)
 
         r.elapsed_seconds = (datetime.now() - t0).total_seconds()
         if self.output_dir:
@@ -128,6 +135,8 @@ class LoopSubAgent:
         initial_pr: Optional[Dict[str, Any]],
         max_iter: int,
         t0: datetime,
+        prompt_style: Optional[str] = None,
+        feedback_level: Optional[str] = None,
     ) -> LoopResult:
         iterations: List[LoopIteration] = []
         token_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -146,7 +155,8 @@ class LoopSubAgent:
 
         for i in range(1, max_iter + 1):
             # 1) review
-            rev = await self._review(issue, current_pr, repo_path)
+            rev = await self._review(issue, current_pr, repo_path,
+                                     prompt_style=prompt_style)
             iterations.append(self._mk_iter(i, "review",
                                             rev.get("decision", "request_changes"),
                                             rev.get("confidence", 0.5),
@@ -181,7 +191,9 @@ class LoopSubAgent:
             if not self.revise_skill:
                 break
             new_pr = await self._revise(issue, current_pr, rev.get("defects", []), repo_path,
-                                        decision=rev.get("decision", "request_changes"))
+                                        decision=rev.get("decision", "request_changes"),
+                                        prompt_style=prompt_style,
+                                        feedback_level=feedback_level)
             if not new_pr or not new_pr.get("diff"):
                 iterations.append(self._mk_iter(i, "revise", "failed", 0.0, 0, notes="empty diff"))
                 break
@@ -217,6 +229,7 @@ class LoopSubAgent:
         repo_path: Optional[str],
         n: int,
         t0: datetime,
+        prompt_style: Optional[str] = None,
     ) -> LoopResult:
         """Generates N candidates, reviews each, returns first approved or highest-confidence."""
         iterations: List[LoopIteration] = []
@@ -238,7 +251,8 @@ class LoopSubAgent:
             cand = {"title": gen.get("title", ""),
                     "body": gen.get("body", ""),
                     "diff": gen.get("diff", "")}
-            rev = await self._review(issue, cand, repo_path)
+            rev = await self._review(issue, cand, repo_path,
+                                     prompt_style=prompt_style)
             iterations.append(self._mk_iter(k, "review",
                                             rev.get("decision", "request_changes"),
                                             rev.get("confidence", 0.5), len(rev.get("defects", [])),
@@ -288,16 +302,21 @@ class LoopSubAgent:
         initial_pr: Optional[Dict[str, Any]],
         n: int,
         t0: datetime,
+        prompt_style: Optional[str] = None,
+        feedback_level: Optional[str] = None,
     ) -> LoopResult:
         n = min(n, 3)
-        bon = await self._run_best_of_n(issue, repo_path, n, t0)
+        bon = await self._run_best_of_n(issue, repo_path, n, t0,
+                                        prompt_style=prompt_style)
         if bon.success:
             bon.strategy = "hybrid"
             bon.message = f"hybrid: best_of_n approved in {n} candidates"
             return bon
         # 用 best candidate 作为初始 PR，跑 review_guided
         seed_pr = {"diff": bon.final_pr_diff, "title": "Hybrid seed", "body": ""}
-        rg = await self._run_review_guided(issue, repo_path, seed_pr, self.max_iterations, t0)
+        rg = await self._run_review_guided(issue, repo_path, seed_pr, self.max_iterations, t0,
+                                           prompt_style=prompt_style,
+                                           feedback_level=feedback_level)
         rg.strategy = "hybrid"
         rg.iterations = bon.iterations + rg.iterations
         rg.total_iterations = len(rg.iterations)

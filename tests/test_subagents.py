@@ -447,10 +447,10 @@ def test_loop_passes_real_decision_to_reviser(sample_diff):
 
 def test_best_effort_json_direct_brace_span_and_garbage():
     from swe_review.subagents.reviewer_agent import _best_effort_json
-    assert _best_effort_json('{"a": 1}') == {"a": 1}
-    assert _best_effort_json('noise before {"a": 1} noise after') == {"a": 1}
-    assert _best_effort_json("") is None
-    assert _best_effort_json("not json at all") is None
+    assert _best_effort_json('{"a": 1}') == ({"a": 1}, False)
+    assert _best_effort_json('noise before {"a": 1} noise after') == ({"a": 1}, False)
+    assert _best_effort_json("") == (None, False)
+    assert _best_effort_json("not json at all") == (None, False)
 
 
 def test_best_effort_json_truncation_repair():
@@ -458,8 +458,8 @@ def test_best_effort_json_truncation_repair():
     from swe_review.subagents.reviewer_agent import _best_effort_json
     full = _json.dumps(ENGINEERING_PAYLOAD, ensure_ascii=False)
     truncated = full[: len(full) - 200]  # cut into the tail
-    obj = _best_effort_json(truncated)
-    assert obj is not None
+    obj, repaired = _best_effort_json(truncated)
+    assert obj is not None and repaired is True
     assert obj.get("decision") == "REQUEST_CHANGES"
     # the leading findings survive the truncation repair
     assert len(obj.get("findings", [])) >= 1
@@ -495,6 +495,34 @@ def test_execute_repairs_malformed_json_with_one_retry():
     assert report.token_usage == {"prompt_tokens": 7, "completion_tokens": 7}
 
 
+def test_execute_truncation_triggers_repair_round():
+    """A repaired (truncated) parse must NOT be accepted silently — the tail may
+    hold findings (possibly a P0), so one LLM repair round still runs."""
+    import asyncio, json as _json
+
+    full = _json.dumps(ENGINEERING_PAYLOAD, ensure_ascii=False)
+    truncated = full[: len(full) - 200]
+
+    class StubAdapter:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, system, user, max_tokens=4096, temperature=0.1):
+            self.calls.append(system)
+            if len(self.calls) == 1:
+                return truncated, {"prompt_tokens": 3, "completion_tokens": 2}
+            return full, {"prompt_tokens": 4, "completion_tokens": 5}
+
+    adapter = StubAdapter()
+    sub = ReviewerSubAgent(tool_adapter=adapter, prompt_style="engineering")
+    report = asyncio.run(sub.execute({
+        "issue": "x", "pr_title": "t", "pr_diff": "diff --git a/a b/a\n",
+    }))
+    assert len(adapter.calls) == 2                       # repair round fired
+    assert report.truncated_repair is False              # final report is complete
+    assert len(report.findings) == len(ENGINEERING_PAYLOAD["findings"])
+
+
 def test_parse_error_surfaced_when_unrepairable():
     import asyncio
 
@@ -515,3 +543,49 @@ def test_parse_error_surfaced_when_unrepairable():
     assert report.decision == "request_changes"
     assert adapter.calls == 2  # one repair attempt, then give up
     assert report.to_dict()["parse_error"] is not None
+    # the failed repair round's tokens must NOT be lost
+    assert report.token_usage == {"prompt_tokens": 2, "completion_tokens": 2}
+
+
+def test_loop_runtime_style_overrides_reach_skills(sample_diff):
+    """context prompt_style / revision_feedback_level must actually reach the
+    review and revise calls (previously a dead path)."""
+    import asyncio
+
+    class FakeReviewSkill:
+        def __init__(self):
+            self.calls = 0
+            self.kwargs_seen = []
+
+        async def execute(self, **kwargs):
+            self.calls += 1
+            self.kwargs_seen.append(kwargs)
+            decision = "request_changes" if self.calls == 1 else "approve"
+
+            class Out:
+                def to_dict(self_inner, deep=False):
+                    return {"decision": decision, "confidence": 0.8,
+                            "defects": [{"severity": "high", "description": "d",
+                                         "location": "a.py:1", "suggestion": "s"}],
+                            "findings": [], "token_usage": None}
+            return Out()
+
+    class FakeReviseSkill:
+        def __init__(self):
+            self.kwargs_seen = []
+
+        async def execute(self, **kwargs):
+            self.kwargs_seen.append(kwargs)
+            return {"title": "t", "body": "b", "diff": sample_diff,
+                    "changes_summary": "fixed"}
+
+    review, revise = FakeReviewSkill(), FakeReviseSkill()
+    loop = LoopSubAgent(review_skill=review, revise_skill=revise, max_iterations=3)
+    asyncio.run(loop.execute({
+        "issue": "x", "initial_pr": {"diff": sample_diff},
+        "prompt_style": "detailed",
+        "revision_feedback_level": "minimal_feedback",
+    }))
+    assert review.kwargs_seen[0]["prompt_style"] == "detailed"
+    assert revise.kwargs_seen[0]["prompt_style"] == "detailed"
+    assert revise.kwargs_seen[0]["feedback_level"] == "minimal_feedback"
