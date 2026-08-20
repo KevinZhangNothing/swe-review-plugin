@@ -229,6 +229,19 @@ def system_prompt() -> str:
     )
 
 
+def truncate_json_text(ctx_json: str, limit: int = 60_000) -> str:
+    """Size-limit a JSON context blob at a newline boundary so the prompt never
+    receives a slice cut mid-string / mid-escape."""
+    if len(ctx_json) <= limit:
+        return ctx_json
+    cut = ctx_json.rfind("\n", 0, limit)
+    if cut <= 0:
+        cut = limit
+    else:
+        cut += 1  # keep the newline so the slice ends at a line boundary
+    return ctx_json[:cut] + "... (truncated)"
+
+
 def user_prompt(
     issue: str,
     pr_title: str,
@@ -237,9 +250,7 @@ def user_prompt(
     repo_context: Dict[str, Any],
     analysis: Dict[str, Any],
 ) -> str:
-    ctx_json = json.dumps(repo_context, indent=2, ensure_ascii=False)
-    if len(ctx_json) > 60_000:
-        ctx_json = ctx_json[:60_000] + "\n... (truncated)"
+    ctx_json = truncate_json_text(json.dumps(repo_context, indent=2, ensure_ascii=False))
     return (
         "## Change Context / Intent\n"
         f"{issue}\n\n"

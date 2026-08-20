@@ -35,6 +35,7 @@ from pathlib import Path
 from datetime import datetime
 
 from . import engineering_prompt
+from .engineering_prompt import truncate_json_text
 
 
 # Defect severity & category enumerations
@@ -421,9 +422,7 @@ def _system_prompt_detailed() -> str:
 # nudges the model to NOT read the patch during Step 1, forces Step 3 (own
 # proposed fix) before reading the candidate, and emphasizes Step 4b / 5 checks.
 def _user_prompt_detailed(issue, pr_title, pr_body, pr_diff, repo_context, analysis):
-    ctx_json = json.dumps(repo_context, indent=2, ensure_ascii=False)
-    if len(ctx_json) > 60_000:
-        ctx_json = ctx_json[:60_000] + "\n... (truncated)"
+    ctx_json = truncate_json_text(json.dumps(repo_context, indent=2, ensure_ascii=False))
     return (
         "## Issue Description\n"
         f"{issue}\n\n"
@@ -665,9 +664,7 @@ class ReviewerSubAgent:
         }
 
     def _build_user_prompt_concise(self, issue, pr_title, pr_body, pr_diff, repo_context, analysis):
-        ctx_json = json.dumps(repo_context, indent=2, ensure_ascii=False)
-        if len(ctx_json) > 60_000:
-            ctx_json = ctx_json[:60_000] + "\n... (truncated)"
+        ctx_json = truncate_json_text(json.dumps(repo_context, indent=2, ensure_ascii=False))
         return (
             f"## Issue\n{issue}\n\n"
             f"## PR Metadata\n- Title: {pr_title}\n- Description: {pr_body or 'N/A'}\n\n"
@@ -983,7 +980,8 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
         total_score = None
 
     # Consistency: total must equal the sum of the 8 dimensions; the
-    # per-dimension scores are the evidence-based source of truth.
+    # per-dimension scores are the evidence-based source of truth. When the
+    # model under-reports dimensions, never trust its self-reported total.
     dim_values = [entry.get("score") for entry in scores.values()]
     if len(dim_values) == len(SCORE_DIMENSIONS) and all(
         isinstance(v, (int, float)) for v in dim_values
@@ -991,6 +989,8 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
         computed = float(sum(dim_values))
         if total_score is None or abs(total_score - computed) > 0.01:
             total_score = computed
+    else:
+        total_score = None
 
     hard_gate = data.get("hard_gate", {}) or {}
     if not isinstance(hard_gate, dict):

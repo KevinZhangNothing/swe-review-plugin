@@ -306,6 +306,28 @@ def test_engineering_total_score_recomputed_from_dimensions():
     assert r.total_score == 69.0  # 12+9+13+7+8+5+6+9
 
 
+def test_engineering_incomplete_dimensions_invalidate_total():
+    """With dimensions missing, the model's self-reported total is not trusted."""
+    import copy
+    payload = copy.deepcopy(ENGINEERING_PAYLOAD)
+    del payload["scores"]["risk"]
+    payload["total_score"] = 95
+    r = _parse_engineering_payload(payload, None)
+    assert r.total_score is None
+
+
+def test_truncate_json_text_cuts_at_newline_boundary():
+    from swe_review.subagents.engineering_prompt import truncate_json_text
+    short = '{"a": 1}'
+    assert truncate_json_text(short) == short
+    long_text = '{\n' + ',\n'.join(f'"k{i}": "v{i}"' for i in range(5000)) + '\n}'
+    cut = truncate_json_text(long_text, limit=1000)
+    assert cut.endswith("... (truncated)")
+    body = cut[: -len("... (truncated)")]
+    assert body.endswith("\n")  # cut at a line boundary, not mid-token
+    assert len(body) <= 1000 + 1
+
+
 def test_engineering_unknown_severity_is_conservative():
     """Unrecognized severity must not be silently demoted below the block gate."""
     import copy
@@ -593,6 +615,58 @@ def test_hybrid_forwards_runtime_max_iterations():
     asyncio.run(loop.execute({"issue": "x", "strategy": "hybrid",
                               "max_iterations": 7}))
     assert captured["max_iter"] == 7
+
+
+def test_loop_stops_on_unparseable_review(sample_diff):
+    """Round-6: a persistently unparseable review carries no actionable feedback —
+    stop early instead of blind-revising until max_iterations."""
+    import asyncio
+
+    class UnparseableReviewSkill:
+        async def execute(self, **kwargs):
+            class Out:
+                def to_dict(self_inner, deep=False):
+                    return {"decision": "request_changes", "confidence": 0.5,
+                            "defects": [], "findings": [], "token_usage": None,
+                            "parse_error": "not valid JSON"}
+            return Out()
+
+    class FakeReviseSkill:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, **kwargs):
+            self.calls += 1
+            return {"title": "t", "body": "b", "diff": sample_diff,
+                    "changes_summary": "fixed"}
+
+    revise = FakeReviseSkill()
+    loop = LoopSubAgent(review_skill=UnparseableReviewSkill(),
+                        revise_skill=revise, max_iterations=5)
+    result = asyncio.run(loop.execute({"issue": "x",
+                                       "initial_pr": {"diff": sample_diff}}))
+    assert result.success is False
+    assert result.final_decision == "review_unparseable"
+    assert "unparseable" in result.message
+    assert revise.calls == 0  # no blind revision
+
+
+def test_review_skill_ok_false_on_parse_error():
+    """Round-6: ReviewSkill.execute must not report ok=True for a fallback
+    report produced by unparseable model output."""
+    import asyncio
+    from swe_review import ReviewSkill
+
+    class GarbageAdapter:
+        async def chat(self, system, user, max_tokens=4096, temperature=0.1):
+            return "not json {{{", {"prompt_tokens": 1, "completion_tokens": 1}
+
+    skill = ReviewSkill(tool_adapter=GarbageAdapter())
+    res = asyncio.run(skill.execute(issue="x", pr_title="t",
+                                    pr_diff="diff --git a/a b/a\n"))
+    assert res.ok is False
+    assert res.payload["parse_error"] is not None
+    assert "parse_error" in res.message
 
 
 def test_loop_withholds_approve_on_untrusted_review(sample_diff):

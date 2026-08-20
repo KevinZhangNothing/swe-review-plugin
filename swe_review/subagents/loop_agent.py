@@ -169,6 +169,23 @@ class LoopSubAgent:
                                                    "approve withheld") if rev_unreliable else None))
             self._accum_tokens(token_total, rev.get("token_usage"))
 
+            # Completely unparseable review output carries no actionable feedback;
+            # blind revision cannot converge — stop early with an explicit verdict.
+            # (truncated_repair alone still holds partial findings, so it goes
+            # through the normal revise path instead.)
+            if rev.get("parse_error"):
+                return LoopResult(
+                    success=False,
+                    final_decision="review_unparseable",
+                    final_pr_diff=current_pr.get("diff", ""),
+                    total_iterations=len(iterations),
+                    iterations=iterations,
+                    resolve_rate=0.0,
+                    token_usage_total=token_total,
+                    strategy="review_guided",
+                    message="review output unparseable; no actionable feedback — loop stopped",
+                )
+
             # A truncated or unparseable-then-failed review cannot guarantee the
             # lost tail held no P0 — withhold approve and force another revision.
             if not rev_unreliable and rev.get("decision") in DECISION_APPROVING:

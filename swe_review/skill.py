@@ -141,10 +141,11 @@ class ReviewSkill:
         }
         report: ReviewReport = await self.subagent.execute(ctx)
         return SkillResult(
-            ok=(report.decision in DECISION_CHOICES),
+            ok=(report.decision in DECISION_CHOICES and not report.parse_error),
             payload=report.to_dict(deep=deep),
             raw=report,
-            message=f"reviewed (prompt_style={report.prompt_style}, deep={deep})",
+            message=f"reviewed (prompt_style={report.prompt_style}, deep={deep})"
+                    + (f"; parse_error={report.parse_error}" if report.parse_error else ""),
         )
 
 
