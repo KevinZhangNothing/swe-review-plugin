@@ -97,8 +97,10 @@ class AnalyzerSubAgent:
         cur_add, cur_del = 0, 0
 
         def flush():
-            nonlocal current_file, current_header, current_lines, cur_add, cur_del
-            if current_header or current_lines:
+            # NOTE: do NOT reset current_file here — a file spans multiple hunks,
+            # and a @@-triggered flush must keep the file context for following lines.
+            nonlocal current_header, current_lines, cur_add, cur_del
+            if current_header:
                 hunks.append({
                     "file": current_file,
                     "header": current_header,
@@ -106,7 +108,6 @@ class AnalyzerSubAgent:
                     "additions": cur_add,
                     "deletions": cur_del,
                 })
-            current_file = ""
             current_header = ""
             current_lines = []
             cur_add, cur_del = 0, 0
@@ -115,13 +116,11 @@ class AnalyzerSubAgent:
             if line.startswith("diff --git"):
                 flush()
                 parts = line.split()
-                if len(parts) >= 3:
-                    current_file = parts[2].replace("a/", "").replace("b/", "")
+                current_file = parts[2].removeprefix("a/").removeprefix("b/") if len(parts) >= 3 else ""
             elif line.startswith("@@"):
-                if current_header or current_lines:
-                    flush()
+                flush()
                 current_header = line
-            elif current_file:
+            elif current_file and current_header:
                 if line.startswith("+++") or line.startswith("---"):
                     continue
                 current_lines.append(line)

@@ -506,7 +506,7 @@ class ReviewerSubAgent:
             if line.startswith("diff --git"):
                 parts = line.split()
                 if len(parts) >= 3:
-                    files.append(parts[2].replace("a/", "").replace("b/", ""))
+                    files.append(parts[2].removeprefix("a/").removeprefix("b/"))
         return {
             "repo_path": None,
             "files_modified": files,

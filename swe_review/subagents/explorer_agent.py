@@ -131,7 +131,7 @@ class ExplorerSubAgent:
             if line.startswith("diff --git"):
                 parts = line.split()
                 if len(parts) >= 3:
-                    f = parts[2].replace("a/", "").replace("b/", "")
+                    f = parts[2].removeprefix("a/").removeprefix("b/")
                     if f not in files:
                         files.append(f)
         return files
