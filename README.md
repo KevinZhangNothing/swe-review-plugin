@@ -637,8 +637,8 @@ flowchart LR
 
 | Metric | 定义 | 本插件在哪收集 |
 |--------|------|---------------|
-| **CR (Completion Rate)** | reviewer 输出可解析 JSON 的比例 | `ReviewerSubAgent._parse_response` 成功分支 |
-| **DA (Decision Accuracy)** | approve/request-changes 与 ground-truth 一致 | `VerifierSubAgent` 提供 oracle 对照（**不进** review prompt） |
+| **CR (Completion Rate)** | reviewer 输出可被**干净**解析为 JSON 的比例（容错修复路径以 `parse_error` / `truncated_repair` 标志另行统计） | `ReviewerSubAgent._parse_response` 成功分支 |
+| **DA (Decision Accuracy)** | 4 值决策归并为二元后与 ground-truth 一致（approve + approve_with_suggestions → approve；request_changes + block → request_changes） | `VerifierSubAgent` 提供 oracle 对照（**不进** review prompt） |
 | **RRR (Resolve Rate after Revision)** | approved 后实际解决率 | `LoopSkill` 的 `resolve_rate`（= verifier 状态 → 1.0 / 0.5 / 0.0） |
 
 ### 评测模式的数据隔离

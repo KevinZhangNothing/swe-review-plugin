@@ -113,6 +113,7 @@ class LoopSubAgent:
                                           prompt_style=prompt_style)
         elif strategy == "hybrid":
             r = await self._run_hybrid(issue, repo_path, initial_pr, n_best, t0,
+                                       max_iter=max_iter,
                                        prompt_style=prompt_style,
                                        feedback_level=feedback_level)
         else:
@@ -157,14 +158,20 @@ class LoopSubAgent:
             # 1) review
             rev = await self._review(issue, current_pr, repo_path,
                                      prompt_style=prompt_style)
+            rev_unreliable = bool(rev.get("truncated_repair") or rev.get("parse_error"))
             iterations.append(self._mk_iter(i, "review",
                                             rev.get("decision", "request_changes"),
                                             rev.get("confidence", 0.5),
                                             len(rev.get("defects", [])),
-                                            token_usage=rev.get("token_usage")))
+                                            token_usage=rev.get("token_usage"),
+                                            notes=("untrusted review output "
+                                                   "(truncated_repair/parse_error); "
+                                                   "approve withheld") if rev_unreliable else None))
             self._accum_tokens(token_total, rev.get("token_usage"))
 
-            if rev.get("decision") in DECISION_APPROVING:
+            # A truncated or unparseable-then-failed review cannot guarantee the
+            # lost tail held no P0 — withhold approve and force another revision.
+            if not rev_unreliable and rev.get("decision") in DECISION_APPROVING:
                 # 如有 verifier，跑一次验证作为 RRR 信号
                 rr = await self._verify(current_pr, repo_path)
                 if rr:
@@ -253,12 +260,15 @@ class LoopSubAgent:
                     "diff": gen.get("diff", "")}
             rev = await self._review(issue, cand, repo_path,
                                      prompt_style=prompt_style)
+            rev_unreliable = bool(rev.get("truncated_repair") or rev.get("parse_error"))
             iterations.append(self._mk_iter(k, "review",
                                             rev.get("decision", "request_changes"),
                                             rev.get("confidence", 0.5), len(rev.get("defects", [])),
-                                            token_usage=rev.get("token_usage")))
+                                            token_usage=rev.get("token_usage"),
+                                            notes=("untrusted review output; "
+                                                   "approve withheld") if rev_unreliable else None))
             self._accum_tokens(token_total, rev.get("token_usage"))
-            if rev.get("decision") in DECISION_APPROVING:
+            if not rev_unreliable and rev.get("decision") in DECISION_APPROVING:
                 rr = await self._verify(cand, repo_path)
                 if rr:
                     iterations.append(self._mk_iter(k, "verify",
@@ -302,6 +312,7 @@ class LoopSubAgent:
         initial_pr: Optional[Dict[str, Any]],
         n: int,
         t0: datetime,
+        max_iter: Optional[int] = None,
         prompt_style: Optional[str] = None,
         feedback_level: Optional[str] = None,
     ) -> LoopResult:
@@ -314,7 +325,8 @@ class LoopSubAgent:
             return bon
         # 用 best candidate 作为初始 PR，跑 review_guided
         seed_pr = {"diff": bon.final_pr_diff, "title": "Hybrid seed", "body": ""}
-        rg = await self._run_review_guided(issue, repo_path, seed_pr, self.max_iterations, t0,
+        rg = await self._run_review_guided(issue, repo_path, seed_pr,
+                                           max_iter or self.max_iterations, t0,
                                            prompt_style=prompt_style,
                                            feedback_level=feedback_level)
         rg.strategy = "hybrid"

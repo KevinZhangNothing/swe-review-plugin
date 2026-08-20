@@ -567,6 +567,69 @@ def test_parse_error_surfaced_when_unrepairable():
     assert report.token_usage == {"prompt_tokens": 2, "completion_tokens": 2}
 
 
+def test_hybrid_forwards_runtime_max_iterations():
+    """Round-5 self-review: hybrid phase must honor the runtime max_iterations
+    override instead of hardcoding self.max_iterations."""
+    import asyncio
+    from swe_review.subagents.loop_agent import LoopResult
+
+    loop = LoopSubAgent()
+    captured = {}
+
+    async def fake_bon(issue, repo_path, n, t0, prompt_style=None):
+        return LoopResult(success=False, final_decision="reject",
+                          final_pr_diff="d", total_iterations=0,
+                          strategy="best_of_n")
+
+    async def fake_rg(issue, repo_path, initial_pr, max_iter, t0,
+                      prompt_style=None, feedback_level=None):
+        captured["max_iter"] = max_iter
+        return LoopResult(success=True, final_decision="approve",
+                          final_pr_diff="d", total_iterations=1,
+                          strategy="review_guided")
+
+    loop._run_best_of_n = fake_bon
+    loop._run_review_guided = fake_rg
+    asyncio.run(loop.execute({"issue": "x", "strategy": "hybrid",
+                              "max_iterations": 7}))
+    assert captured["max_iter"] == 7
+
+
+def test_loop_withholds_approve_on_untrusted_review(sample_diff):
+    """Round-5 self-review: an approving review whose output was truncated
+    (tail findings possibly lost, possibly a P0) must NOT terminate the loop
+    as success — force another revision round instead."""
+    import asyncio
+
+    class UntrustedApproveSkill:
+        async def execute(self, **kwargs):
+            class Out:
+                def to_dict(self_inner, deep=False):
+                    return {"decision": "approve", "confidence": 0.9,
+                            "defects": [], "findings": [], "token_usage": None,
+                            "truncated_repair": True, "parse_error": None}
+            return Out()
+
+    class FakeReviseSkill:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, **kwargs):
+            self.calls += 1
+            return {"title": "t", "body": "b", "diff": sample_diff,
+                    "changes_summary": "fixed"}
+
+    revise = FakeReviseSkill()
+    loop = LoopSubAgent(review_skill=UntrustedApproveSkill(),
+                        revise_skill=revise, max_iterations=2)
+    result = asyncio.run(loop.execute({"issue": "x",
+                                       "initial_pr": {"diff": sample_diff}}))
+    assert result.success is False       # approve withheld
+    assert revise.calls >= 1             # forced revision instead
+    review_iters = [it for it in result.iterations if it.phase == "review"]
+    assert all("untrusted" in (it.notes or "") for it in review_iters)
+
+
 def test_loop_runtime_style_overrides_reach_skills(sample_diff):
     """context prompt_style / revision_feedback_level must actually reach the
     review and revise calls (previously a dead path)."""
