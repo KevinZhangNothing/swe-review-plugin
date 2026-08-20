@@ -296,6 +296,26 @@ def test_engineering_p1_downgrades_approving_decision():
     assert _parse_engineering_payload(payload, None).decision == "block"
 
 
+def test_engineering_total_score_recomputed_from_dimensions():
+    """total_score must equal the sum of the 8 dimensions — per-dimension scores
+    are the evidence-based source of truth."""
+    import copy
+    payload = copy.deepcopy(ENGINEERING_PAYLOAD)
+    payload["total_score"] = 95  # model claims more than its own dimensions add up to
+    r = _parse_engineering_payload(payload, None)
+    assert r.total_score == 69.0  # 12+9+13+7+8+5+6+9
+
+
+def test_engineering_unknown_severity_is_conservative():
+    """Unrecognized severity must not be silently demoted below the block gate."""
+    import copy
+    payload = copy.deepcopy(ENGINEERING_PAYLOAD)
+    payload["findings"][0]["severity"] = "critical"  # not in P0..P4
+    r = _parse_engineering_payload(payload, None)
+    assert r.findings[0].severity == "P1"
+    assert r.defects[0].severity == "high"
+
+
 def test_finding_to_defect_carries_impact_and_evidence():
     """The revise chain must receive evidence-rich feedback, not a weakened copy."""
     f = Finding(

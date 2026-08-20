@@ -945,9 +945,12 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
     for f in data.get("findings", []) or []:
         if not isinstance(f, dict):
             continue
-        sev = str(f.get("severity", "P2")).upper()
+        sev_raw = str(f.get("severity", "") or "").strip().upper()
+        # Conservative default for unrecognized severity: P1, never silently
+        # demote an unknown signal below the block gate (P0/P1 territory).
+        severity = sev_raw if sev_raw in FINDING_SEVERITIES else "P1"
         findings.append(Finding(
-            severity=pick_enum(sev, FINDING_SEVERITIES, "P2"),
+            severity=severity,
             title=str(f.get("title", "") or ""),
             location=f.get("location", ""),
             observation=str(f.get("observation", "") or ""),
@@ -978,6 +981,16 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
         total_score = float(total_score) if total_score is not None else None
     except (TypeError, ValueError):
         total_score = None
+
+    # Consistency: total must equal the sum of the 8 dimensions; the
+    # per-dimension scores are the evidence-based source of truth.
+    dim_values = [entry.get("score") for entry in scores.values()]
+    if len(dim_values) == len(SCORE_DIMENSIONS) and all(
+        isinstance(v, (int, float)) for v in dim_values
+    ):
+        computed = float(sum(dim_values))
+        if total_score is None or abs(total_score - computed) > 0.01:
+            total_score = computed
 
     hard_gate = data.get("hard_gate", {}) or {}
     if not isinstance(hard_gate, dict):
