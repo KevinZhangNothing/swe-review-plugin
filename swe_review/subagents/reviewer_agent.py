@@ -1018,6 +1018,21 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
 
     defects = [f.to_defect() for f in findings]
 
+    # Fallback: if the model occasionally answers in the legacy shape
+    # (defects[] but no findings[]), preserve the feedback instead of
+    # dropping it on the floor.
+    if not defects:
+        for d in data.get("defects", []) or []:
+            if not isinstance(d, dict):
+                continue
+            defects.append(Defect(
+                severity=pick_enum(d.get("severity", "medium"), DEFECT_SEVERITIES, "medium"),
+                category=pick_enum(d.get("category", "correctness"), DEFECT_CATEGORIES, "correctness"),
+                description=d.get("description", ""),
+                location=d.get("location", ""),
+                suggestion=d.get("suggestion", ""),
+            ))
+
     return ReviewReport(
         decision=decision,
         confidence=confidence,

@@ -619,6 +619,24 @@ def test_hybrid_forwards_runtime_max_iterations():
     assert captured["max_iter"] == 7
 
 
+def test_engineering_legacy_shape_fallback():
+    """Round-8 P3: if the model answers in the legacy defects[] shape, the
+    feedback must not be silently dropped."""
+    payload = {
+        "decision": "REQUEST_CHANGES",
+        "confidence": 0.8,
+        "summary": {},
+        "defects": [
+            {"severity": "high", "description": "legacy bug",
+             "location": "a.py:3", "suggestion": "fix it"},
+        ],
+        "findings": [],
+    }
+    r = _parse_engineering_payload(payload, None)
+    assert r.decision == "request_changes"
+    assert len(r.defects) == 1 and r.defects[0].severity == "high"
+
+
 def test_loop_stops_on_unparseable_review(sample_diff):
     """Round-6: a persistently unparseable review carries no actionable feedback —
     stop early instead of blind-revising until max_iterations."""

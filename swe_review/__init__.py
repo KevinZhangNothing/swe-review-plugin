@@ -1,7 +1,10 @@
 """SWE-Review - Agentic Code Review (close the loop on issue resolution)."""
 
 from .skill import ReviewSkill, ReviseSkill, ExploreSkill, VerifySkill, LoopSkill, AnalyzeSkill, GenerateSkill
-from .subagents.reviewer_agent import ReviewerSubAgent, ReviewReport, Defect, Finding
+from .subagents.reviewer_agent import (
+    ReviewerSubAgent, ReviewReport, Defect, Finding,
+    DECISION_CHOICES, DECISION_APPROVING, DECISION_REJECTING,
+)
 from .subagents.reviser_agent import ReviserSubAgent, RevisedPR
 from .subagents.explorer_agent import ExplorerSubAgent, ExplorationResult
 from .subagents.verifier_agent import VerifierSubAgent, VerificationResult
@@ -21,6 +24,7 @@ __all__ = [
     "ReviewSkill", "ReviseSkill", "ExploreSkill", "VerifySkill",
     "LoopSkill", "AnalyzeSkill", "GenerateSkill",
     "ReviewerSubAgent", "ReviewReport", "Defect", "Finding",
+    "DECISION_CHOICES", "DECISION_APPROVING", "DECISION_REJECTING",
     "ReviserSubAgent", "RevisedPR",
     "ExplorerSubAgent", "ExplorationResult",
     "VerifierSubAgent", "VerificationResult",
