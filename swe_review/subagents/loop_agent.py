@@ -21,6 +21,22 @@ from pathlib import Path
 from .reviewer_agent import DECISION_APPROVING
 
 
+def _unwrap_skill(out: Any) -> Dict[str, Any]:
+    """SkillResult 信封解包：execute() 返回 {ok, payload, raw, message}，
+    循环编排需要的是扁平 payload。同时兼容已解包 dict / 裸 payload dict。
+    判定依据：同时含 'ok' 与 dict 型 'payload' 才视为信封，避免误拆
+    业务 payload 中恰好名为 'payload' 的字段。"""
+    if hasattr(out, "to_dict"):
+        d = out.to_dict()
+    elif isinstance(out, dict):
+        d = out
+    else:
+        return {}
+    if isinstance(d, dict) and "ok" in d and isinstance(d.get("payload"), dict):
+        return d["payload"]
+    return d
+
+
 @dataclass
 class LoopIteration:
     iteration: int
@@ -368,7 +384,9 @@ class LoopSubAgent:
             repo_path=repo_path,
             prompt_style=prompt_style,
         )
-        d = out.to_dict() if hasattr(out, "to_dict") else dict(out)
+        # SkillResult 信封解包（修复：此前直接读信封顶层导致 decision
+        # 恒为默认值 request_changes、defects 恒空、revise 恒 empty diff）
+        d = _unwrap_skill(out)
         # Robustness: ensure required keys exist (both flat and nested shapes pass through)
         d.setdefault("decision", "request_changes")
         d.setdefault("confidence", 0.5)
@@ -395,11 +413,11 @@ class LoopSubAgent:
             prompt_style=prompt_style,
             feedback_level=feedback_level,
         )
-        if hasattr(out, "diff"):
-            return {"title": out.title, "body": out.body, "diff": out.diff,
-                    "changes_summary": out.changes_summary}
-        if isinstance(out, dict):
-            return out
+        d = _unwrap_skill(out)
+        if d:
+            return {"title": d.get("title", ""), "body": d.get("body", ""),
+                    "diff": d.get("diff", ""),
+                    "changes_summary": d.get("changes_summary", "")}
         return None
 
     async def _generate(self, issue: str, repo_path: Optional[str]) -> Dict[str, Any]:
@@ -409,7 +427,7 @@ class LoopSubAgent:
             issue=issue,
             repo_path=repo_path,
         )
-        return out.to_dict() if hasattr(out, "to_dict") else dict(out)
+        return _unwrap_skill(out)
 
     async def _verify(
         self, pr: Dict[str, Any], repo_path: Optional[str],
@@ -421,10 +439,7 @@ class LoopSubAgent:
             pr_diff=pr.get("diff", ""),
             repo_path=repo_path,
         )
-        if hasattr(out, "to_dict"):
-            d = out.to_dict()
-        else:
-            d = dict(out)
+        d = _unwrap_skill(out)
         return {
             "passed": d.get("passed", False),
             "confidence": d.get("confidence", 0.0),
