@@ -10,6 +10,7 @@ Analyzer SubAgent - 静态分析
 """
 
 import re
+from collections import Counter
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field, asdict
 
@@ -23,9 +24,82 @@ class AnalyzerResult:
     public_api_changes: List[str]
     suspicious_spots: List[Dict[str, str]]
     complexity_score: float
+    # Copy-paste redundancy signal: identical added lines repeated across
+    # multiple hunks/files — evidence for "extract a common function instead
+    # of duplicating". Fed to the reviewer inside Patch Analysis.
+    repeated_added_blocks: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+# Lines that repeat for idiomatic reasons, not because of copy-paste
+# redundancy: imports, comments, bare closers/keywords.
+_REDUNDANCY_SKIP_RE = re.compile(
+    r"^(import |from |#|//|/\*|\*|\"\"\"|'''"
+    r"|[}\])]+;?$"
+    r"|return$|raise$|pass$|continue$|break$|else:?$|try:?$)"
+)
+
+
+def detect_repeated_added_blocks(
+    pr_diff: str,
+    min_line_len: int = 12,
+    min_count: int = 2,
+    cap: int = 10,
+) -> List[Dict[str, Any]]:
+    """Static redundancy signal: identical added lines repeated across the diff.
+
+    Reports added lines that occur >= `min_count` times in >=2 distinct
+    (file, hunk) locations — i.e. copy-pasted logic that should likely be
+    extracted into a shared/common function or reuse an existing one. This is
+    EVIDENCE for the reviewer, not a verdict: short/idiomatic lines are
+    filtered out to keep noise low.
+
+    Returns a list capped at `cap` entries (most repeated first):
+      {"line": str, "count": int, "files": [..], "hunks": int}
+    """
+    counts: Counter = Counter()
+    locations: Dict[str, set] = {}
+    current_file = ""
+    hunk_idx = 0
+    for line in pr_diff.split("\n"):
+        if line.startswith("diff --git"):
+            parts = line.split()
+            current_file = (
+                parts[2].removeprefix("a/").removeprefix("b/")
+                if len(parts) >= 3 else ""
+            )
+            continue
+        if line.startswith("@@"):
+            hunk_idx += 1
+            continue
+        if line.startswith("+++") or not line.startswith("+"):
+            continue
+        text = line[1:].strip()
+        if len(text) < min_line_len or _REDUNDANCY_SKIP_RE.match(text):
+            continue
+        counts[text] += 1
+        locations.setdefault(text, set()).add((current_file, hunk_idx))
+
+    out: List[Dict[str, Any]] = []
+    for text, cnt in counts.most_common():
+        if cnt < min_count:
+            break
+        locs = locations[text]
+        # Require repetition ACROSS hunks/files; repeats inside a single hunk
+        # are too likely to be incidental (test assertions, similar branches).
+        if len(locs) < 2:
+            continue
+        out.append({
+            "line": text[:120],
+            "count": cnt,
+            "files": sorted({f for f, _ in locs if f})[:5],
+            "hunks": len(locs),
+        })
+        if len(out) >= cap:
+            break
+    return out
 
 
 class AnalyzerSubAgent:
@@ -87,6 +161,7 @@ class AnalyzerSubAgent:
             public_api_changes=public_api_changes[:20],
             suspicious_spots=suspicious[:20],
             complexity_score=round(score, 3),
+            repeated_added_blocks=detect_repeated_added_blocks(pr_diff),
         )
 
     def _split_hunks(self, pr_diff: str) -> List[Dict[str, Any]]:

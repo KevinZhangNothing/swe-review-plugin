@@ -766,3 +766,93 @@ def test_loop_runtime_style_overrides_reach_skills(sample_diff):
     assert review.kwargs_seen[0]["prompt_style"] == "detailed"
     assert revise.kwargs_seen[0]["prompt_style"] == "detailed"
     assert revise.kwargs_seen[0]["feedback_level"] == "minimal_feedback"
+
+
+
+# ---------------------------------------------------------------------------
+# Redundancy / reuse checks — repeated_added_blocks signal + prompt clauses
+# ---------------------------------------------------------------------------
+
+REDUNDANT_DIFF = (
+    "diff --git a/service_a.py b/service_a.py\n"
+    "@@ -1,2 +1,4 @@\n"
+    " def a():\n"
+    "+    total = price * quantity * (1 - discount)\n"
+    "+    logger.info('computed total for order %s', order_id)\n"
+    "+    return round(total, 2)\n"
+    " pass\n"
+    "diff --git a/service_b.py b/service_b.py\n"
+    "@@ -1,2 +1,4 @@\n"
+    " def b():\n"
+    "+    total = price * quantity * (1 - discount)\n"
+    "+    logger.info('computed total for order %s', order_id)\n"
+    "+    return round(total, 2)\n"
+    " pass\n"
+)
+
+
+def test_detect_repeated_added_blocks_flags_cross_file_copy_paste():
+    from swe_review.subagents.analyzer_agent import detect_repeated_added_blocks
+    blocks = detect_repeated_added_blocks(REDUNDANT_DIFF)
+    assert len(blocks) >= 2
+    lines = {b["line"] for b in blocks}
+    assert "total = price * quantity * (1 - discount)" in lines
+    top = blocks[0]
+    assert top["count"] >= 2 and top["hunks"] >= 2
+    assert "service_a.py" in top["files"] and "service_b.py" in top["files"]
+
+
+def test_detect_repeated_added_blocks_empty_when_unique():
+    from swe_review.subagents.analyzer_agent import detect_repeated_added_blocks
+    unique = (
+        "diff --git a/x.py b/x.py\n@@ -1,1 +1,3 @@\n def x():\n"
+        "+    alpha = compute_alpha(value)\n"
+        "+    beta = compute_beta(value)\n"
+    )
+    assert detect_repeated_added_blocks(unique) == []
+
+
+def test_detect_repeated_added_blocks_filters_short_and_imports():
+    from swe_review.subagents.analyzer_agent import detect_repeated_added_blocks
+    diff = (
+        "diff --git a/m.py b/m.py\n@@ -1,1 +1,2 @@\n pass\n"
+        "+import os\n"
+        "+    x = 1\n"
+        "diff --git a/n.py b/n.py\n@@ -1,1 +1,2 @@\n pass\n"
+        "+import os\n"
+        "+    x = 1\n"
+    )
+    assert detect_repeated_added_blocks(diff) == []
+
+
+def test_analyzer_result_exposes_repeated_added_blocks():
+    sub = AnalyzerSubAgent()
+    import asyncio
+    result = asyncio.run(sub.execute({"pr_diff": REDUNDANT_DIFF}))
+    assert len(result.repeated_added_blocks) >= 2
+    assert "repeated_added_blocks" in result.to_dict()
+
+
+def test_reviewer_patch_analysis_includes_redundancy_signal():
+    sub = ReviewerSubAgent(tool_adapter=None)
+    analysis = sub._analyze_patch(
+        REDUNDANT_DIFF, {"files_modified": ["service_a.py", "service_b.py"]}
+    )
+    assert analysis["repeated_added_blocks"]
+    assert analysis["files_changed"] == 2
+
+
+def test_engineering_prompt_covers_reuse_and_redundancy():
+    from swe_review.subagents import engineering_prompt
+    sp = engineering_prompt.system_prompt()
+    assert "Reuse Impact" in sp
+    assert "repeated_added_blocks" in sp
+    assert "提取公共函数" in sp
+
+
+def test_legacy_review_prompts_cover_redundancy():
+    from swe_review.subagents.reviewer_agent import (
+        _system_prompt_concise, _system_prompt_detailed,
+    )
+    assert "Redundancy check" in _system_prompt_concise()
+    assert "copy-paste" in _system_prompt_detailed()

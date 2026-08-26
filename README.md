@@ -46,7 +46,7 @@ flowchart TB
     subgraph SubAgents["⚙️ SubAgent Layer (subagents/)"]
         direction LR
         E[ExplorerSubAgent<br/><i>grep + 调用链追踪</i>]
-        A[AnalyzerSubAgent<br/><i>hunk 统计 + API 检测</i>]
+        A[AnalyzerSubAgent<br/><i>hunk 统计 + API 检测 + 冗余信号</i>]
         G[GeneratorSubAgent<br/><i>LLM 生成 diff</i>]
         R[ReviewerSubAgent<br/><i>LLM 审查 + JSON 报告</i>]
         RV[ReviserSubAgent<br/><i>LLM 修订 diff</i>]
@@ -82,7 +82,7 @@ flowchart LR
     subgraph Flow["🔄 处理流"]
         direction TB
         EXP[Explorer<br/><i>grep 关键词<br/>追踪调用链<br/>读取源文件</i>]
-        ANL[Analyzer<br/><i>统计 hunk<br/>检测 public API<br/>计算复杂度</i>]
+        ANL[Analyzer<br/><i>统计 hunk<br/>检测 public API<br/>检测重复/冗余块<br/>计算复杂度</i>]
         REV[Reviewer<br/><i>LLM 审查<br/>输出 structured JSON</i>]
         FIX[Reviser<br/><i>LLM 修订<br/>生成新 diff</i>]
         VER[Verifier<br/><i>git apply<br/>运行测试<br/>可选 oracle 对比</i>]
@@ -339,6 +339,7 @@ classDiagram
         +List~str~ public_api_changes
         +List~Dict~ suspicious_spots
         +float complexity_score
+        +List~Dict~ repeated_added_blocks
     }
 
     LoopResult *-- LoopIteration

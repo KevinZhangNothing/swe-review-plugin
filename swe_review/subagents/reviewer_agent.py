@@ -35,6 +35,7 @@ from pathlib import Path
 from datetime import datetime
 
 from . import engineering_prompt
+from .analyzer_agent import detect_repeated_added_blocks
 from .engineering_prompt import truncate_json_text
 
 
@@ -302,6 +303,12 @@ def _system_prompt_concise() -> str:
         "- For nonlocal bugs: trace the call chain. A classic symptom-fix pattern is "
         "a downstream module adding a guard while the real bug lives in an "
         "upstream caller — your defect must point at the upstream location.\n"
+        "- Redundancy check: if the patch copy-pastes logic that already exists "
+        "elsewhere in the repository, or repeats the same block across "
+        "files/functions, instead of reusing the existing helper or extracting a "
+        "common function, report a `maintainability` defect (high when the "
+        "duplication is substantial). Use `repeated_added_blocks` in Patch "
+        "Analysis as evidence.\n"
         "- Suggestions MUST point at the right direction without copying a known fix."
     )
 
@@ -378,7 +385,11 @@ def _system_prompt_detailed() -> str:
         "- Missing sibling fix (same bug in related code path not patched)\n"
         "- Exception or crash introduced\n"
         "- Security vulnerability\n\n"
-        "**Medium**: Performance regression, less efficient but functionally correct\n\n"
+        "**Medium**: Performance regression, less efficient but functionally correct; "
+        "substantial copy-paste of logic that already exists in the repository (or "
+        "self-repetition across files/functions) where an existing helper should be "
+        "reused or a common function extracted — corroborate with "
+        "`repeated_added_blocks` in Patch Analysis\n\n"
         "**Low**: Style, variable naming, comments, minor refactoring (no behavior change)\n\n"
         "## HARD RULE — Symptom fix detection\n"
         "If ANY of these match, it is a symptom fix → `request_changes` "
@@ -668,6 +679,10 @@ class ReviewerSubAgent:
             "total_deletions": deletions,
             "total_changes": additions + deletions,
             "files_changed": len(repo_context.get("files_modified", [])),
+            # Static copy-paste redundancy evidence (same added lines repeated
+            # across hunks/files) — the prompt instructs the model to judge
+            # reuse / common-function extraction based on this.
+            "repeated_added_blocks": detect_repeated_added_blocks(pr_diff),
         }
 
     def _build_user_prompt_concise(self, issue, pr_title, pr_body, pr_diff, repo_context, analysis):
