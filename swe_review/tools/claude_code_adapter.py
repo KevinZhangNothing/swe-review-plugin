@@ -39,11 +39,10 @@ class ClaudeCodeAdapter:
     def __init__(
         self,
         cli_path: Optional[str] = None,
-        model: Optional[str] = None,
-        timeout: int = 600,
+        timeout: int = 1800,
     ):
         self.cli_path = cli_path or _find_cli()
-        self.model = model or os.environ.get("CLAUDE_CODE_MODEL")
+        # 设计原则：swe 循环不指定具体模型 —— 永远不传 --model，也不读 *_MODEL 环境变量。
         self.timeout = timeout
         self._claude_env = load_claude_env()
 
@@ -64,7 +63,7 @@ class ClaudeCodeAdapter:
         argv = [self.cli_path, "-p", "--bare"]
         if output_format and output_format != "text":
             argv += ["--output-format", output_format]
-        # 不主动加 --model（遵守官方 SKILL §1："don't default to --model"）
+        # 不加 --model（遵守官方 SKILL §1："don't default to --model"；模型由宿主环境决定）
         argv.append(full_prompt)
 
         out, err, rc = run_in_pty(

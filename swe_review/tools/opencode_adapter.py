@@ -37,11 +37,11 @@ class OpenCodeAdapter:
     def __init__(
         self,
         cli_path: Optional[str] = None,
-        model: Optional[str] = None,
-        timeout: int = 600,
+        timeout: int = 1800,
     ):
         self.cli_path = cli_path or _find_cli()
-        self.model = model or os.environ.get("OPENCODE_MODEL")
+        # 设计原则：swe 循环不指定具体模型 —— 永远不传 --model，也不读 *_MODEL 环境变量。
+        # 模型由 opencode 工程配置/默认 provider 决定（也避免 unknown-server 错）。
         self.timeout = timeout
 
     async def chat(
@@ -61,12 +61,9 @@ class OpenCodeAdapter:
         }
         # 不要把 cwd 强制设到工程根（外部调用方可能用别的 repo）
 
-        argv = [self.cli_path, "run"]
-        # 仅当用户明确指定 OPENCODE_MODEL 才传 --model。
-        # 否则让 opencode 用工程配置/默认 provider，避免 unknown-server 错。
-        if self.model:
-            argv += ["--model", self.model]
-        argv.append(full_prompt)
+        # 不加 --model：让 opencode 用工程配置/默认 provider（设计原则，
+        # 同时避免 unknown-server 错）。
+        argv = [self.cli_path, "run", full_prompt]
 
         out, err, rc = run_subprocess(argv, timeout=self.timeout, extra_env=env)
         text_clean = strip_ansi(out)
@@ -102,7 +99,7 @@ class OpenCodeAdapter:
             "name": self.name,
             "cli": self.cli_path,
             "configured": bool(shutil.which(self.cli_path)),
-            "model": self.model,
+            "model": "(inherited from CLI — never pinned by swe-review)",
         }
 
     def diagnose(self) -> Dict[str, Any]:

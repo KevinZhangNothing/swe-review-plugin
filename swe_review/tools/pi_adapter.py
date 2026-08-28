@@ -41,14 +41,14 @@ class PiAdapter:
     def __init__(
         self,
         cli_path: Optional[str] = None,
-        model: Optional[str] = None,
         skills_dir: Optional[str] = None,
         timeout: int = 600,
         auto_install_skills: bool = True,
         skills_source_dir: Optional[Path] = None,
     ):
         self.cli_path = cli_path or _find_cli()
-        self.model = model or os.environ.get("PI_MODEL")
+        # 设计原则：swe 循环不指定具体模型 —— 模型由宿主 CLI/环境决定，
+        # adapter 永远不传 --model，也不读 *_MODEL 环境变量。
         self.skills_dir = Path(skills_dir).expanduser() if skills_dir else PI_DEFAULT_SKILLS_ROOT
         self.timeout = timeout
         self.auto_install_skills = auto_install_skills
@@ -109,9 +109,8 @@ class PiAdapter:
             "IMPORTANT: Output ONLY valid JSON. No prose, no markdown fences."
         )
 
+        # 不加 --model：模型选择交给 pi 自身配置（设计原则）。
         argv = [self.cli_path, "--mode", "print", "-p", full_prompt]
-        if self.model:
-            argv += ["--model", self.model]
 
         env = {"PI_NO_TUI": "1"}
         out, err, rc = run_subprocess(argv, timeout=self.timeout, extra_env=env)
@@ -149,7 +148,7 @@ class PiAdapter:
             "cli": self.cli_path,
             "configured": bool(shutil.which(self.cli_path)),
             "skills_dir": str(self.skills_dir),
-            "model": self.model,
+            "model": "(inherited from CLI — never pinned by swe-review)",
         }
 
     def diagnose(self) -> Dict[str, Any]:

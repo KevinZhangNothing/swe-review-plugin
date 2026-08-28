@@ -29,11 +29,10 @@ class CursorAdapter:
     def __init__(
         self,
         cli_path: Optional[str] = None,
-        model: Optional[str] = None,
         timeout: int = 600,
     ):
         self.cli_path = cli_path or _find_cli()
-        self.model = model or os.environ.get("CURSOR_MODEL")
+        # 设计原则：swe 循环不指定具体模型 —— 永远不传 --model，也不读 *_MODEL 环境变量。
         self.timeout = timeout
 
     async def chat(
@@ -49,10 +48,8 @@ class CursorAdapter:
         )
 
         # 顺序：agent --print --trust <prompt>
-        # 不主动加 --model（按官方 SKILL §1 "不要默认加 --model"）。
+        # 不加 --model（按官方 SKILL §1 "不要默认加 --model"；模型由宿主环境决定）。
         argv = [self.cli_path, "--print", "--trust", full_prompt]
-        if self.model:
-            argv += ["--model", self.model]
 
         out, err, rc = run_in_pty(argv, timeout=self.timeout)
         text_clean = strip_ansi(out)
@@ -88,7 +85,7 @@ class CursorAdapter:
             "name": self.name,
             "cli": self.cli_path,
             "configured": bool(shutil.which(self.cli_path)),
-            "model": self.model,
+            "model": "(inherited from CLI — never pinned by swe-review)",
         }
 
     def diagnose(self) -> Dict[str, Any]:

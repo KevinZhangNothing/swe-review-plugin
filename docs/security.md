@@ -39,7 +39,7 @@ ok = diff.startswith(("diff ", "diff --git")) and "@@" in diff
 
 - 不在仓库内出现任何 API key。
 - `install.sh` 创建 `.env.local` 模板，由用户填充。
-- Adapter 通过环境变量读 model 名称（如 `CLAUDE_CODE_MODEL`、`PI_MODEL`），不传敏感数据。
+- Adapter 不读也不传任何 model 名称：swe 循环不指定具体模型，模型选择完全交给宿主 CLI/环境（不读 `*_MODEL` 环境变量，不传 `--model`）。
 
 ## 5. Pi Skill Installation
 

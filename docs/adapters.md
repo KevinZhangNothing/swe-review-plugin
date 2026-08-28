@@ -15,7 +15,7 @@
 ## 调用契约
 
 ```python
-adapter = SomeAdapter()  # 一般无参；可接受 cli_path / model
+adapter = SomeAdapter()  # 一般无参；可接受 cli_path（不接受 model —— 循环不指定模型）
 text, tok = await adapter.chat(system=..., user=..., max_tokens=4096, temperature=0.1)
 ```
 
