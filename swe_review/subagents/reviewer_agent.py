@@ -485,6 +485,8 @@ class ReviewerSubAgent:
         config: Optional[Dict[str, Any]] = None,
         prompt_style: str = "engineering",
         explore_timeout: int = 180,
+        max_regen_attempts: int = 3,
+        regen_backoff_seconds: float = 2.0,
     ):
         if prompt_style not in PROMPT_STYLE_CHOICES:
             raise ValueError(
@@ -495,6 +497,11 @@ class ReviewerSubAgent:
         self.config = config or {}
         self.prompt_style = prompt_style
         self.explore_timeout = explore_timeout
+        # Long-form structured answers intermittently come back empty or
+        # unparseable from hosted gateways (observed twice in self-loop runs).
+        # Each fresh attempt still gets the one-shot JSON repair round.
+        self.max_regen_attempts = max(1, int(max_regen_attempts))
+        self.regen_backoff_seconds = max(0.0, float(regen_backoff_seconds))
         self.name = "reviewer"
         self.capabilities = [
             "analyze_diff",
@@ -593,37 +600,55 @@ class ReviewerSubAgent:
         # 4) AI call — engineering reports (8 scored dimensions + findings) need
         # more completion budget than the legacy bug-centric styles.
         max_tokens = 8192 if prompt_style == "engineering" else 4096
-        response, token_usage = await self._call_ai_tool(
-            system_prompt, user_prompt, max_tokens=max_tokens
-        )
-        report = self._parse_response(response, token_usage, prompt_style=prompt_style)
-        was_truncated = report.truncated_repair
-        if (report.parse_error or report.truncated_repair) and self.tool_adapter:
-            # One repair round for malformed model JSON (unescaped quotes, missing
-            # commas) or truncation (repaired parse lost the tail — possibly
-            # findings, possibly a P0). Bounded: exactly one extra call.
-            repaired, extra_usage = await self._call_ai_tool(
-                _JSON_REPAIR_SYSTEM,
-                _json_repair_user(response, report.parse_error or "truncated JSON"),
-                max_tokens=max_tokens,
+
+        # Empty/unparseable long-form answers flake intermittently on hosted
+        # gateways (self-loop observation): retry FRESH full calls up to
+        # max_regen_attempts; every attempt still gets the one-shot JSON
+        # repair round below. A wasted empty answer costs the full prompt
+        # anyway, so retrying is cheaper than letting the loop die.
+        report: Optional[ReviewReport] = None
+        response = ""
+        token_usage: Dict[str, int] = {}
+        for attempt in range(1, self.max_regen_attempts + 1):
+            response, call_usage = await self._call_ai_tool_with_retries(
+                system_prompt, user_prompt, max_tokens=max_tokens
             )
-            token_usage = _merge_token_usage(token_usage, extra_usage)
-            retry_report = self._parse_response(
-                repaired, token_usage, prompt_style=prompt_style
-            )
-            if not retry_report.parse_error and not retry_report.truncated_repair:
-                report = retry_report
-                response = repaired
-                if was_truncated:
-                    # Trust state follows content provenance, not parse method: the
-                    # repair round can close structure but cannot prove the lost
-                    # tail's findings were recovered. Keep the final report
-                    # untrusted so downstream gates (loop withhold-approve) hold.
-                    report.truncated_repair = True
-            else:
-                # Repair round failed — keep the best parse we have, but do not
-                # lose the repair call's token cost.
-                report.token_usage = token_usage
+            # Regen retries must not silently drop earlier attempts' cost.
+            token_usage = _merge_token_usage(token_usage, call_usage)
+            report = self._parse_response(response, token_usage, prompt_style=prompt_style)
+            was_truncated = report.truncated_repair
+            if (report.parse_error or report.truncated_repair) and self.tool_adapter:
+                # One repair round for malformed model JSON (unescaped quotes, missing
+                # commas) or truncation (repaired parse lost the tail — possibly
+                # findings, possibly a P0). Bounded: exactly one extra call.
+                repaired, extra_usage = await self._call_ai_tool_with_retries(
+                    _JSON_REPAIR_SYSTEM,
+                    _json_repair_user(response, report.parse_error or "truncated JSON"),
+                    max_tokens=max_tokens,
+                )
+                token_usage = _merge_token_usage(token_usage, extra_usage)
+                retry_report = self._parse_response(
+                    repaired, token_usage, prompt_style=prompt_style
+                )
+                if not retry_report.parse_error and not retry_report.truncated_repair:
+                    report = retry_report
+                    response = repaired
+                    if was_truncated:
+                        # Trust state follows content provenance, not parse method: the
+                        # repair round can close structure but cannot prove the lost
+                        # tail's findings were recovered. Keep the final report
+                        # untrusted so downstream gates (loop withhold-approve) hold.
+                        report.truncated_repair = True
+                else:
+                    # Repair round failed — keep the best parse we have, but do not
+                    # lose the repair call's token cost.
+                    report.token_usage = token_usage
+            if not report.parse_error or not self.tool_adapter:
+                break
+            if attempt < self.max_regen_attempts:
+                await asyncio.sleep(self.regen_backoff_seconds * attempt)
+
+        assert report is not None
         report.raw_response = response
         report.exploration_steps = exploration_steps
         return report
@@ -711,6 +736,22 @@ class ReviewerSubAgent:
                 max_tokens=max_tokens, temperature=0.1,
             )
         return "{}", {"prompt_tokens": 0, "completion_tokens": 0}
+
+    async def _call_ai_tool_with_retries(self, system_prompt: str, user_prompt: str,
+                                         max_tokens: int = 4096, attempts: int = 3):
+        """_call_ai_tool with bounded retry on transient adapter errors
+        (gateway 429/budget blips, CLI timeouts). The last failure re-raises
+        so hard outages still surface loudly."""
+        last_exc: Optional[Exception] = None
+        for i in range(attempts):
+            try:
+                return await self._call_ai_tool(system_prompt, user_prompt,
+                                                max_tokens=max_tokens)
+            except Exception as exc:  # adapter errors vary by CLI
+                last_exc = exc
+                if i < attempts - 1:
+                    await asyncio.sleep(self.regen_backoff_seconds * (i + 1))
+        raise last_exc
 
     def _parse_response(self, response, token_usage, prompt_style):
         data, repaired = _best_effort_json(_strip_fences(response))

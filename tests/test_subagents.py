@@ -579,16 +579,18 @@ def test_parse_error_surfaced_when_unrepairable():
             return "definitely not json {{{", {"prompt_tokens": 1, "completion_tokens": 1}
 
     adapter = GarbageAdapter()
-    sub = ReviewerSubAgent(tool_adapter=adapter, prompt_style="engineering")
+    sub = ReviewerSubAgent(tool_adapter=adapter, prompt_style="engineering",
+                           regen_backoff_seconds=0.0)
     report = asyncio.run(sub.execute({
         "issue": "x", "pr_title": "t", "pr_diff": "diff --git a/a b/a\n",
     }))
     assert report.parse_error is not None
     assert report.decision == "request_changes"
-    assert adapter.calls == 2  # one repair attempt, then give up
+    # bounded regen retries: max_regen_attempts x (original + repair round)
+    assert adapter.calls == 6
     assert report.to_dict()["parse_error"] is not None
-    # the failed repair round's tokens must NOT be lost
-    assert report.token_usage == {"prompt_tokens": 2, "completion_tokens": 2}
+    # no attempt's token cost may be lost (6 calls x {1,1})
+    assert report.token_usage == {"prompt_tokens": 6, "completion_tokens": 6}
 
 
 def test_hybrid_forwards_runtime_max_iterations():
@@ -917,7 +919,8 @@ def test_empty_review_payload_triggers_internal_repair():
             return self._responses[idx], {"prompt_tokens": 1, "completion_tokens": 1}
 
     stub = StubAdapter()
-    agent = ReviewerSubAgent(tool_adapter=stub, prompt_style="engineering")
+    agent = ReviewerSubAgent(tool_adapter=stub, prompt_style="engineering",
+                             regen_backoff_seconds=0.0)
     report = asyncio.run(agent.execute({
         "issue": "issue text",
         "pr_title": "pr title",
@@ -928,3 +931,55 @@ def test_empty_review_payload_triggers_internal_repair():
     assert report.parse_error is None
     assert report.decision == "approve"
     assert report.total_score == 8.0
+
+
+def test_unparseable_review_retries_fresh_calls():
+    """When both the answer and its repair round come back empty, the
+    reviewer must regenerate with a fresh call (bounded by
+    max_regen_attempts) instead of handing the loop a parse_error."""
+    import asyncio
+    import json
+
+    valid_report = {
+        "decision": "APPROVE",
+        "confidence": 0.9,
+        "summary": {"problem": "p", "solution": "s", "overall_assessment": "ok"},
+        "findings": [],
+        "scores": {
+            "design_quality": {"score": 1, "reason": ""},
+            "maintainability": {"score": 1, "reason": ""},
+            "consistency": {"score": 1, "reason": ""},
+            "simplicity": {"score": 1, "reason": ""},
+            "readability": {"score": 1, "reason": ""},
+            "testability": {"score": 1, "reason": ""},
+            "risk": {"score": 1, "reason": ""},
+            "change_scope": {"score": 1, "reason": ""},
+        },
+        "total_score": 8,
+        "hard_gate": {"triggered": False, "reason": ""},
+    }
+
+    class StubAdapter:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, system, user, **kw):
+            self.calls.append(user)
+            tok = {"prompt_tokens": 1, "completion_tokens": 1}
+            # attempt 1 (original + repair) and attempt 2's original all
+            # come back empty; attempt 2's repair round finally succeeds.
+            if len(self.calls) >= 4:
+                return json.dumps(valid_report), tok
+            return "{}", tok
+
+    stub = StubAdapter()
+    agent = ReviewerSubAgent(tool_adapter=stub, prompt_style="engineering",
+                             regen_backoff_seconds=0.0)
+    report = asyncio.run(agent.execute({
+        "issue": "issue text",
+        "pr_title": "pr title",
+        "pr_diff": "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+    }))
+    assert len(stub.calls) == 4, f"expected 4 calls (2 attempts x original+repair), got {len(stub.calls)}"
+    assert report.parse_error is None
+    assert report.decision == "approve"
