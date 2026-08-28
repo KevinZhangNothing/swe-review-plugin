@@ -856,3 +856,26 @@ def test_legacy_review_prompts_cover_redundancy():
     )
     assert "Redundancy check" in _system_prompt_concise()
     assert "copy-paste" in _system_prompt_detailed()
+
+
+def test_empty_review_payload_is_flagged():
+    """Regression (self-loop run): a content-free model answer like `{}` used
+    to degrade into a silent request_changes@0.5 with zero findings and burn
+    a loop iteration. It must now surface as a parse_error so the repair
+    path retries."""
+    from swe_review.subagents.reviewer_agent import _is_empty_review_payload
+
+    assert _is_empty_review_payload({})
+    assert _is_empty_review_payload({"noise": "x"})
+    assert not _is_empty_review_payload({"decision": "APPROVE"})
+    assert not _is_empty_review_payload({"findings": [{"severity": "P2"}]})
+    assert not _is_empty_review_payload({"defects": [{"severity": "high"}]})
+    assert not _is_empty_review_payload({"summary": {"problem": "p"}})
+    assert not _is_empty_review_payload({"scores": {"risk": {"score": 5}}})
+    assert _is_empty_review_payload({"scores": {"risk": {"score": None}}})
+
+    agent = ReviewerSubAgent()
+    report = agent._parse_response("{}", {}, "engineering")
+    assert report.parse_error and "empty" in report.parse_error
+    # repair path must pick this up
+    assert report.parse_error or report.truncated_repair

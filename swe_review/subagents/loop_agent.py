@@ -47,6 +47,8 @@ class LoopIteration:
     timestamp: str
     token_usage: Optional[Dict[str, int]] = None
     notes: Optional[str] = None
+    # review 阶段的完整报告（findings/score 等）；聚合值之外的明细不再丢失。
+    review_payload: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -175,14 +177,16 @@ class LoopSubAgent:
             rev = await self._review(issue, current_pr, repo_path,
                                      prompt_style=prompt_style)
             rev_unreliable = bool(rev.get("truncated_repair") or rev.get("parse_error"))
-            iterations.append(self._mk_iter(i, "review",
-                                            rev.get("decision", "request_changes"),
-                                            rev.get("confidence", 0.5),
-                                            len(rev.get("defects", [])),
-                                            token_usage=rev.get("token_usage"),
-                                            notes=("untrusted review output "
-                                                   "(truncated_repair/parse_error); "
-                                                   "approve withheld") if rev_unreliable else None))
+            it = self._mk_iter(i, "review",
+                               rev.get("decision", "request_changes"),
+                               rev.get("confidence", 0.5),
+                               len(rev.get("defects", [])),
+                               token_usage=rev.get("token_usage"),
+                               notes=("untrusted review output "
+                                      "(truncated_repair/parse_error); "
+                                      "approve withheld") if rev_unreliable else None)
+            it.review_payload = rev
+            iterations.append(it)
             self._accum_tokens(token_total, rev.get("token_usage"))
 
             # Completely unparseable review output carries no actionable feedback;
@@ -294,12 +298,14 @@ class LoopSubAgent:
             rev = await self._review(issue, cand, repo_path,
                                      prompt_style=prompt_style)
             rev_unreliable = bool(rev.get("truncated_repair") or rev.get("parse_error"))
-            iterations.append(self._mk_iter(k, "review",
-                                            rev.get("decision", "request_changes"),
-                                            rev.get("confidence", 0.5), len(rev.get("defects", [])),
-                                            token_usage=rev.get("token_usage"),
-                                            notes=("untrusted review output; "
-                                                   "approve withheld") if rev_unreliable else None))
+            it = self._mk_iter(k, "review",
+                               rev.get("decision", "request_changes"),
+                               rev.get("confidence", 0.5), len(rev.get("defects", [])),
+                               token_usage=rev.get("token_usage"),
+                               notes=("untrusted review output; "
+                                      "approve withheld") if rev_unreliable else None)
+            it.review_payload = rev
+            iterations.append(it)
             self._accum_tokens(token_total, rev.get("token_usage"))
             if not rev_unreliable and rev.get("decision") in DECISION_APPROVING:
                 rr = await self._verify(cand, repo_path)

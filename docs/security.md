@@ -40,6 +40,7 @@ ok = diff.startswith(("diff ", "diff --git")) and "@@" in diff
 - 不在仓库内出现任何 API key。
 - `install.sh` 创建 `.env.local` 模板，由用户填充。
 - Adapter 不读也不传任何 model 名称：swe 循环不指定具体模型，模型选择完全交给宿主 CLI/环境（不读 `*_MODEL` 环境变量，不传 `--model`）。
+- Subagent 调用是**纯文本生成**，不给宿主 CLI 放 write/edit/bash 工具（pi 用 `--no-tools`）。探索由本地 ExplorerSubAgent 完成；放开工具会让 review 子进程改动目标仓库（实测曾污染 baseline worktree 导致 verify 失败）。已知残留风险：cursor `--trust`、opencode `run` 暂无干净的 no-tools 旗标，调用前请确保目标仓库无未提交变更。
 
 ## 5. Pi Skill Installation
 

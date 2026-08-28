@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
+from .base import MODEL_INHERITED_NOTE
+
 from ._pty_runner import (
     run_subprocess, strip_ansi, strip_fences, extract_tokens_from_text,
 )
@@ -110,7 +112,10 @@ class PiAdapter:
         )
 
         # 不加 --model：模型选择交给 pi 自身配置（设计原则）。
-        argv = [self.cli_path, "--mode", "print", "-p", full_prompt]
+        # --no-tools：subagent 是纯文本生成（探索由本地 ExplorerSubAgent 完成）。
+        # 若放开 write/edit/bash，review 子进程会真的改动目标仓库 —— 实测曾把
+        # baseline worktree 改成 PR 应用后的状态，污染后续 verify 的 patch apply。
+        argv = [self.cli_path, "--mode", "print", "--no-tools", "-p", full_prompt]
 
         env = {"PI_NO_TUI": "1"}
         out, err, rc = run_subprocess(argv, timeout=self.timeout, extra_env=env)
@@ -148,7 +153,7 @@ class PiAdapter:
             "cli": self.cli_path,
             "configured": bool(shutil.which(self.cli_path)),
             "skills_dir": str(self.skills_dir),
-            "model": "(inherited from CLI — never pinned by swe-review)",
+            "model": MODEL_INHERITED_NOTE,
         }
 
     def diagnose(self) -> Dict[str, Any]:

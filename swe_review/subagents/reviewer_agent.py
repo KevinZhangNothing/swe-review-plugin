@@ -726,6 +726,17 @@ class ReviewerSubAgent:
                             else "empty response",
             )
 
+        if _is_empty_review_payload(data):
+            return ReviewReport(
+                decision="request_changes",
+                confidence=0.5,
+                summary={"overall_assessment": "Model returned JSON without any review content"},
+                defects=[],
+                token_usage=token_usage,
+                prompt_style=prompt_style,
+                parse_error="empty JSON payload (no review content)",
+            )
+
         if prompt_style == "engineering":
             report = _parse_engineering_payload(data, token_usage)
         else:
@@ -950,6 +961,37 @@ def _normalize_decision(rec: Any) -> str:
         "BLOCK": "block",
     }
     return mapping.get(key, "request_changes")
+
+
+def _is_empty_review_payload(data: Dict[str, Any]) -> bool:
+    """True when the parsed JSON carries no review content at all (e.g. the
+    model answered `{}` or only noise fields).
+
+    Such payloads used to degrade silently into a default request_changes@0.5
+    with zero findings — wasting a whole loop iteration (regression found by
+    a self-loop run). Flag them as parse errors so the repair path retries.
+    """
+    if not data:
+        return True
+    if data.get("decision") is not None:
+        return False
+    if data.get("findings") or data.get("defects"):
+        return False
+    if data.get("summary"):
+        return False
+    scores = data.get("scores")
+    if isinstance(scores, dict) and any(
+        (isinstance(v, dict) and v.get("score") is not None)
+        or isinstance(v, (int, float))
+        for v in scores.values()
+    ):
+        return False
+    hard_gate = data.get("hard_gate")
+    if isinstance(hard_gate, dict) and hard_gate.get("triggered"):
+        return False
+    if data.get("total_score") is not None:
+        return False
+    return True
 
 
 def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewReport:

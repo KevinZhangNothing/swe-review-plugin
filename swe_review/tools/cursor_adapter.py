@@ -13,6 +13,7 @@ import shutil
 from typing import Dict, Any, Optional, Tuple
 
 from ._pty_runner import run_in_pty, strip_ansi, strip_fences, extract_tokens_from_text
+from .base import MODEL_INHERITED_NOTE
 
 
 def _find_cli() -> str:
@@ -85,7 +86,7 @@ class CursorAdapter:
             "name": self.name,
             "cli": self.cli_path,
             "configured": bool(shutil.which(self.cli_path)),
-            "model": "(inherited from CLI — never pinned by swe-review)",
+            "model": MODEL_INHERITED_NOTE,
         }
 
     def diagnose(self) -> Dict[str, Any]:

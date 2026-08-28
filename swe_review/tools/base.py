@@ -4,6 +4,11 @@ BaseAdapter - 所有 tool adapter 的抽象基类
 
 from typing import Dict, Any, Tuple, Optional
 
+#: get_status() model placeholder — the swe loop never pins a model; model
+#: choice is inherited from the host CLI/environment (swe-review-loop hard
+#: constraint #4).
+MODEL_INHERITED_NOTE = "(inherited from CLI — never pinned by swe-review)"
+
 
 class BaseAdapter:
     name: str = "base"

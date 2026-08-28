@@ -23,6 +23,7 @@ Use when the user wants end-to-end closed-loop processing: a generator produces 
 2. The loop returns the chosen `final_pr_diff` and a structured `LoopResult` you can serialize to JSON.
 3. Default `max_iterations=5`; respect early_stop unless explicitly disabled.
 4. **NEVER** pin or request a specific model anywhere in the loop (no `--model`, no `*_MODEL` env, no `model=` arg). Every subagent inherits whatever model the host CLI/environment is configured with.
+5. **Subagent adapter calls are pure text generation.** Never grant the host CLI write/edit/bash tools to a subagent call (pi: `--no-tools`). Exploration is done locally by `ExplorerSubAgent`; a review/reviser with tool access can mutate the repo under review and corrupt the verifier baseline.
 
 ## How to invoke
 
