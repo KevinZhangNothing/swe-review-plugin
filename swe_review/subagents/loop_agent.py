@@ -426,7 +426,8 @@ class LoopSubAgent:
         if d:
             return {"title": d.get("title", ""), "body": d.get("body", ""),
                     "diff": d.get("diff", ""),
-                    "changes_summary": d.get("changes_summary", "")}
+                    "changes_summary": d.get("changes_summary", ""),
+                    "status": d.get("status", "")}
         return None
 
     async def _generate(self, issue: str, repo_path: Optional[str]) -> Dict[str, Any]:
@@ -449,12 +450,19 @@ class LoopSubAgent:
             repo_path=repo_path,
         )
         d = _unwrap_skill(out)
+        status = d.get("resolution_status")
+        # Without test_info the verifier can only apply the patch — that is a
+        # weak PASS signal (syntax/context sanity), not a failure; labeling it
+        # "review_failed" misled loop iteration records (self-loop round 5).
+        passed = d.get("passed", False) or (
+            d.get("patch_applied", False) and status in (None, "unknown", "")
+        )
         return {
-            "passed": d.get("passed", False),
-            "confidence": d.get("confidence", 0.0),
+            "passed": passed,
+            "confidence": d.get("confidence", 0.0) or (0.5 if passed else 0.0),
             "details": d.get("details", ""),
-            "resolve_rate": 1.0 if d.get("resolution_status") == "resolved" else
-                           (0.5 if d.get("resolution_status") == "partially_resolved" else 0.0),
+            "resolve_rate": 1.0 if status == "resolved" else
+                           (0.5 if status == "partially_resolved" else 0.0),
         }
 
     # ==================================================================

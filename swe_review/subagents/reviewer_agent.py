@@ -747,6 +747,9 @@ class ReviewerSubAgent:
             try:
                 return await self._call_ai_tool(system_prompt, user_prompt,
                                                 max_tokens=max_tokens)
+            except FileNotFoundError:
+                # Deterministic (CLI missing) — retrying cannot help.
+                raise
             except Exception as exc:  # adapter errors vary by CLI
                 last_exc = exc
                 if i < attempts - 1:

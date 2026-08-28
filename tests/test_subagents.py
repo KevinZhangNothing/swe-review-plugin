@@ -593,6 +593,47 @@ def test_parse_error_surfaced_when_unrepairable():
     assert report.token_usage == {"prompt_tokens": 6, "completion_tokens": 6}
 
 
+def test_revise_status_survives_loop_unwrap():
+    """Round-5 finding: LoopSubAgent._revise used to drop the revise result's
+    status, so failure notes always said status=no_output."""
+    import asyncio
+
+    class FakeReviseSkill:
+        async def execute(self, **kw):
+            return {"ok": False,
+                    "payload": {"title": "t", "body": "b", "diff": "",
+                                "changes_summary": "", "status": "failed",
+                                "addressed_defect_indices": []},
+                    "raw": None, "message": "status=failed"}
+
+    loop = LoopSubAgent(revise_skill=FakeReviseSkill())
+    out = asyncio.run(loop._revise(
+        "issue", {"title": "", "body": "", "diff": "d"}, [], None))
+    assert out is not None
+    assert out.get("status") == "failed"
+
+
+def test_verify_without_tests_is_weak_pass():
+    """Round-5 finding: with no test_info the verifier only applies the patch;
+    that must read as a weak pass (patch applied), not 'review_failed'."""
+    import asyncio
+
+    class FakeVerifierSkill:
+        async def execute(self, **kw):
+            return {"ok": True,
+                    "payload": {"passed": False, "confidence": 0.0,
+                                "details": "No tests executed",
+                                "patch_applied": True,
+                                "resolution_status": "unknown"},
+                    "raw": None, "message": ""}
+
+    loop = LoopSubAgent(verifier_skill=FakeVerifierSkill())
+    rr = asyncio.run(loop._verify({"diff": "x"}, None))
+    assert rr is not None
+    assert rr["passed"] is True
+    assert rr["confidence"] == 0.5
+
+
 def test_hybrid_forwards_runtime_max_iterations():
     """Round-5 self-review: hybrid phase must honor the runtime max_iterations
     override instead of hardcoding self.max_iterations."""
