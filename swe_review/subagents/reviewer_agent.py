@@ -969,7 +969,10 @@ def _is_empty_review_payload(data: Dict[str, Any]) -> bool:
 
     Such payloads used to degrade silently into a default request_changes@0.5
     with zero findings — wasting a whole loop iteration (regression found by
-    a self-loop run). Flag them as parse errors so the repair path retries.
+    a self-loop run). They are now flagged as parse errors, which triggers
+    ReviewerSubAgent's one-shot internal JSON-repair retry; if that still
+    yields nothing, the loop stops with `review_unparseable` (blind revision
+    cannot converge).
     """
     if not data:
         return True

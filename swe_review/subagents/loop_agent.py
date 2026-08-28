@@ -239,7 +239,10 @@ class LoopSubAgent:
                                         prompt_style=prompt_style,
                                         feedback_level=feedback_level)
             if not new_pr or not new_pr.get("diff"):
-                iterations.append(self._mk_iter(i, "revise", "failed", 0.0, 0, notes="empty diff"))
+                why = (new_pr or {}).get("status") or "no_output"
+                iterations.append(self._mk_iter(
+                    i, "revise", "failed", 0.0, 0,
+                    notes=f"empty diff (revise status={why})"))
                 break
             iterations.append(self._mk_iter(i, "revise", "ok",
                                             0.5, len(rev.get("defects", [])), notes=new_pr.get("changes_summary", "")))

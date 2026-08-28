@@ -9,7 +9,7 @@
 | `ClaudeCodeAdapter` | `claude` | `claude -p --output-format json ...` | 解析 `--output-format json` 为 token 用量 |
 | `CursorAdapter`     | `agent` | `agent --print --trust ...` | Cursor 终端 agent headless |
 | `OpenCodeAdapter`   | `opencode` | `opencode run ...` | 自动读 `~/.claude/skills/` |
-| `PiAdapter`         | `pi` | `pi --mode print -p ... --skill <path>` | 暴露 `--skill` 自动安装 |
+| `PiAdapter`         | `pi` | `pi --mode print --no-tools -p ... --skill <path>` | 暴露 `--skill` 自动安装；`--no-tools` 保证纯文本生成 |
 | `ShellTools`        | (无) | — | 占位 JSON，无 LLM 调用，仅离线测试 |
 
 ## 调用契约

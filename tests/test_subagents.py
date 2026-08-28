@@ -879,3 +879,52 @@ def test_empty_review_payload_is_flagged():
     assert report.parse_error and "empty" in report.parse_error
     # repair path must pick this up
     assert report.parse_error or report.truncated_repair
+
+
+def test_empty_review_payload_triggers_internal_repair():
+    """An empty first answer must trigger ReviewerSubAgent's one-shot JSON
+    repair retry; a good repaired answer becomes the final report."""
+    import asyncio
+    import json
+
+    valid_report = {
+        "decision": "APPROVE",
+        "confidence": 0.9,
+        "summary": {"problem": "p", "solution": "s", "overall_assessment": "ok"},
+        "findings": [],
+        "scores": {
+            "design_quality": {"score": 1, "reason": ""},
+            "maintainability": {"score": 1, "reason": ""},
+            "consistency": {"score": 1, "reason": ""},
+            "simplicity": {"score": 1, "reason": ""},
+            "readability": {"score": 1, "reason": ""},
+            "testability": {"score": 1, "reason": ""},
+            "risk": {"score": 1, "reason": ""},
+            "change_scope": {"score": 1, "reason": ""},
+        },
+        "total_score": 8,
+        "hard_gate": {"triggered": False, "reason": ""},
+    }
+
+    class StubAdapter:
+        def __init__(self):
+            self.calls = []
+            self._responses = ["{}", json.dumps(valid_report)]
+
+        async def chat(self, system, user, **kw):
+            self.calls.append(user)
+            idx = min(len(self.calls) - 1, len(self._responses) - 1)
+            return self._responses[idx], {"prompt_tokens": 1, "completion_tokens": 1}
+
+    stub = StubAdapter()
+    agent = ReviewerSubAgent(tool_adapter=stub, prompt_style="engineering")
+    report = asyncio.run(agent.execute({
+        "issue": "issue text",
+        "pr_title": "pr title",
+        "pr_diff": "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+    }))
+    assert len(stub.calls) == 2, "empty payload must trigger exactly one repair retry"
+    assert "failed to parse" in stub.calls[1].lower() or "json" in stub.calls[1].lower()
+    assert report.parse_error is None
+    assert report.decision == "approve"
+    assert report.total_score == 8.0
