@@ -137,10 +137,10 @@ async def _cmd_loop(args) -> None:
         ClaudeCodeAdapter, CursorAdapter, OpenCodeAdapter, PiAdapter, ShellTools,
     )
     adapters = {
-        "claude-code": ClaudeCodeAdapter(),
-        "cursor": CursorAdapter(),
-        "opencode": OpenCodeAdapter(),
-        "pi": PiAdapter(),
+        "claude-code": ClaudeCodeAdapter(timeout=args.timeout),
+        "cursor": CursorAdapter(timeout=args.timeout),
+        "opencode": OpenCodeAdapter(timeout=args.timeout),
+        "pi": PiAdapter(timeout=args.timeout),
         "shell": ShellTools(),
     }
     tool = adapters[args.tool]
@@ -157,9 +157,17 @@ async def _cmd_loop(args) -> None:
         prompt_style=args.prompt_style,
         revision_feedback_level=args.feedback_level,
     )
+    initial_pr = None
+    if args.initial_pr_diff:
+        initial_pr = {
+            "title": args.initial_pr_title or "",
+            "body": args.initial_pr_body or "",
+            "diff": _read(args.initial_pr_diff),
+        }
     res = await loop.execute(
         issue=args.issue,
         repo_path=args.repo_path,
+        initial_pr=initial_pr,
         strategy=args.strategy,
         n_best_of=args.n_best_of,
         prompt_style=args.prompt_style,
@@ -251,6 +259,15 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["full_feedback", "minimal_feedback", "baseline"])
     p_loop.add_argument("--deep", action="store_true",
                         help="Emit nested review schema in loop iterations.")
+    p_loop.add_argument("--initial-pr-diff", default=None,
+                        help="path or '-' to an existing candidate diff; "
+                             "when given, the loop reviews/revises it instead of "
+                             "generating a candidate first (self-review mode)")
+    p_loop.add_argument("--initial-pr-title", default="")
+    p_loop.add_argument("--initial-pr-body", default="")
+    p_loop.add_argument("--timeout", type=int, default=600,
+                        help="per-call adapter timeout in seconds; engineering "
+                             "reviews take ~6-9 min, so 900+ is safer for pi")
     p_loop.set_defaults(handler=_cmd_loop)
 
     p_ver = sub.add_parser("verify", help="verify a patch via sandbox + tests")

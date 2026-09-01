@@ -88,6 +88,8 @@ print(result.payload)
   },
   "total_score": 0-100,
   "hard_gate": {"triggered": false, "reason": ""},
+  "whats_good": ["做得好的地方（可选，0-3 条）"],
+  "recommended_actions": ["按优先级排序的后续行动（可选）"],
   "findings": [
     {
       "severity": "P0 | P1 | P2 | P3 | P4",
@@ -107,7 +109,16 @@ print(result.payload)
 Decision semantics: `approve` / `approve_with_suggestions` end a review loop as success;
 `request_changes` (≥1 P1) and `block` (P0 or hard gate) trigger revision.
 `defects[]` is auto-derived from `findings[]` (P0/P1→high, P2→medium, P3/P4→low) so
-downstream revise/loop consumers stay compatible.
+downstream revise/loop consumers stay compatible. `whats_good[]` (positive feedback)
+and `recommended_actions[]` (prioritized next steps) are optional fields — absent or
+empty when the model has nothing evidence-backed to say.
+
+Coverage beyond the 8 dimensions is enforced via deep-check checklists inside the prompt:
+security (injection/XSS/SSRF/authZ/secrets/crypto/race), correctness (error handling,
+boundary conditions), actual test coverage of changed paths, removal/dead-code
+candidates (safe-delete vs defer-with-plan), SOLID smells, and language-specific checks
+(JS/TS, Python, Go, Rust, SQL — auto-trimmed to the languages present in the diff to
+control fixed prompt token cost).
 
 ## Output JSON schema — concise / detailed (legacy)
 

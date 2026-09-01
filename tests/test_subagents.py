@@ -11,6 +11,7 @@ from swe_review.subagents.explorer_agent import ExplorerSubAgent
 from swe_review.subagents.verifier_agent import VerifierSubAgent
 from swe_review.subagents.analyzer_agent import AnalyzerSubAgent
 from swe_review.subagents.generator_agent import GeneratorSubAgent
+from swe_review.subagents import engineering_prompt
 from swe_review.subagents.loop_agent import LoopSubAgent
 
 
@@ -261,6 +262,68 @@ def test_engineering_payload_parse_and_defect_mapping():
         "path": "lib/device_manager.dart", "start_line": 120, "end_line": 145,
         "function": None,
     }
+
+
+def test_engineering_optional_feedback_fields_roundtrip():
+    """whats_good / recommended_actions are optional; tolerate string or list,
+    default to empty, and serialize in both flat and deep to_dict()."""
+    import copy
+    # absent → empty defaults
+    r = _parse_engineering_payload(ENGINEERING_PAYLOAD, None)
+    assert r.whats_good == [] and r.recommended_actions == []
+    assert r.to_dict()["whats_good"] == [] and r.to_dict(deep=True)["recommended_actions"] == []
+    # list payload round-trips
+    payload = copy.deepcopy(ENGINEERING_PAYLOAD)
+    payload["whats_good"] = ["清晰的职责拆分", "测试覆盖了异常路径"]
+    payload["recommended_actions"] = ["先拆分 calculateState", "补充缓存写入的单测"]
+    r = _parse_engineering_payload(payload, None)
+    assert r.to_dict()["whats_good"] == ["清晰的职责拆分", "测试覆盖了异常路径"]
+    assert r.to_dict(deep=True)["recommended_actions"][0] == "先拆分 calculateState"
+    # bare string tolerated
+    payload["whats_good"] = "结构清晰"
+    assert _parse_engineering_payload(payload, None).whats_good == ["结构清晰"]
+
+
+def test_engineering_language_checklist_trimming():
+    """Section 十六 is trimmed to the languages present in the diff (P3 self-review
+    finding: fixed prompt token cost). Default keeps full coverage."""
+    full = engineering_prompt.system_prompt()
+    assert "**Go**" in full and "**Rust**" in full and "**SQL**" in full
+    trimmed = engineering_prompt.system_prompt(languages=["Python"])
+    assert "**Python**" in trimmed
+    assert "**Go**" not in trimmed and "**Rust**" not in trimmed
+    assert "**JavaScript/TypeScript**" not in trimmed
+    assert "其他/未识别语言" in trimmed  # universal fallback always kept
+    assert len(trimmed) < len(full)
+    # explicit empty → fallback only
+    assert "**Python**" not in engineering_prompt.system_prompt(languages=[])
+
+
+def test_engineering_detect_languages_from_diff():
+    diff = (
+        "--- a/src/app.py\n+++ b/src/app.py\n"
+        "--- a/web/index.tsx\n+++ b/web/index.tsx\n"
+        "--- a/README.md\n+++ b/README.md\n"
+    )
+    langs = engineering_prompt.detect_languages(diff)
+    assert langs == ["Python", "JavaScript/TypeScript"]
+    assert engineering_prompt.detect_languages("") == []
+    # non-standard diff shapes (P3 self-review finding): quoted paths,
+    # --no-prefix diffs, rename-only entries, and /dev/null must not silently
+    # drop language coverage
+    assert engineering_prompt.detect_languages('+++ "b/dir/my file.py"\n') == ["Python"]
+    assert engineering_prompt.detect_languages("--- main.rs\n+++ main.rs\n") == ["Rust"]
+    assert engineering_prompt.detect_languages(
+        "diff --git a/old.go b/new.go\nrename from old.go\nrename to new.go\n"
+    ) == ["Go"]
+    assert engineering_prompt.detect_languages("--- /dev/null\n+++ b/new.sql\n") == ["SQL"]
+    # diff --git header: quoted paths and paths containing " b/" (loop P3 finding)
+    assert engineering_prompt.detect_languages(
+        'diff --git "a/old name.go" "b/new name.go"\n'
+    ) == ["Go"]
+    assert engineering_prompt.detect_languages(
+        "diff --git a/x b/y b/z.go\n"
+    ) == ["Go"]  # last token wins; the " b/" inside the path is not a delimiter
 
 
 def test_engineering_hard_gate_forces_block():

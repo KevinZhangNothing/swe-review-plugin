@@ -15,10 +15,87 @@ Output contract is STRICT JSON (the pipeline must be able to parse it).
 """
 
 import json
-from typing import Any, Dict
+import os
+import re
+from typing import Any, Dict, Iterable, List, Optional
+
+# Per-language checklist entries for section 十六. Kept as data (not embedded in the
+# prompt literal) so system_prompt() can trim the section to the languages actually
+# present in the diff — see the P3 finding on fixed per-call prompt token cost.
+LANGUAGE_CHECKS: Dict[str, str] = {
+    "JavaScript/TypeScript": "类型安全（any 泄漏）、async/await 错误处理、依赖安全与版本锁定。",
+    "Python": "异常粒度、类型标注、可变默认参数、资源上下文管理。",
+    "Go": "error 是否被忽略、goroutine 泄漏与共享可变状态、interface 使用是否合理。",
+    "Rust": "unwrap()/expect() 滥用、错误传播是否完整、unsafe 边界。",
+    "SQL": "注入风险、查询效率、索引使用。",
+}
+_FALLBACK_LANGUAGE_CHECK = "退回通用原则（正确性、清晰性、安全性）。"
+
+_EXT_TO_LANGUAGE = {
+    ".js": "JavaScript/TypeScript", ".jsx": "JavaScript/TypeScript",
+    ".ts": "JavaScript/TypeScript", ".tsx": "JavaScript/TypeScript",
+    ".mjs": "JavaScript/TypeScript", ".cjs": "JavaScript/TypeScript",
+    ".py": "Python",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".sql": "SQL",
+}
 
 
-def system_prompt() -> str:
+_DIFF_PATH_RE = re.compile(r'^(?:\+\+\+|---)\s+("?)(?:[ab]/)?(.+?)\1\s*$')
+# "diff --git" header: the b/ side is the LAST b/ token (a path may itself
+# contain " b/"), quoted or bare.
+_DIFF_GIT_QUOTED_RE = re.compile(r'"b/([^"]+)"\s*$')
+_DIFF_GIT_BARE_RE = re.compile(r'\sb/(\S+)\s*$')
+
+
+def detect_languages(pr_diff: str) -> List[str]:
+    """Detect checklist languages from a diff's file paths.
+
+    Tolerates quoted paths (``+++ "b/my file.py"``), prefix-less diffs
+    (``git diff --no-prefix``), and rename-only entries (no +++/--- lines,
+    path taken from the ``diff --git`` header). Unrecognized extensions
+    contribute nothing — the caller decides whether an empty result means
+    "trim to fallback only" (default) or "include everything".
+    """
+    langs: List[str] = []
+    for line in pr_diff.splitlines():
+        path = None
+        m = _DIFF_PATH_RE.match(line)
+        if m:
+            path = m.group(2)
+        elif line.startswith("diff --git "):
+            # rename-only entries carry no +++/--- lines; take the b/ side
+            m2 = _DIFF_GIT_QUOTED_RE.search(line) or _DIFF_GIT_BARE_RE.search(line)
+            if m2:
+                path = m2.group(1)
+        if not path or path == "/dev/null":
+            continue
+        lang = _EXT_TO_LANGUAGE.get(os.path.splitext(path)[1].lower())
+        if lang and lang not in langs:
+            langs.append(lang)
+    return langs
+
+
+def _language_section(languages: Optional[Iterable[str]]) -> str:
+    """Build section 十六. languages=None → all entries (backward compatible);
+    an explicit iterable → only the matched entries plus the universal fallback."""
+    if languages is None:
+        entries = list(LANGUAGE_CHECKS.items())
+    else:
+        wanted = set(languages)
+        entries = [(k, v) for k, v in LANGUAGE_CHECKS.items() if k in wanted]
+    parts = [
+        "# 十六、语言与生态特定检查\n\n",
+        "根据代码语言调整检查重点（在通用维度之外追加）：\n",
+    ]
+    for name, check in entries:
+        parts.append(f"- **{name}**：{check}\n")
+    parts.append(f"- **其他/未识别语言**：{_FALLBACK_LANGUAGE_CHECK}\n\n")
+    return "".join(parts)
+
+
+def system_prompt(languages: Optional[Iterable[str]] = None) -> str:
     return (
         "# Code Review Agent System Prompt\n\n"
         "你是一个**高级代码审查（Code Review）Agent**。\n\n"
@@ -57,6 +134,11 @@ def system_prompt() -> str:
         "## 1. Design Quality（权重 20）\n"
         "检查：职责是否正确、模块边界是否合理、抽象是否合理、依赖关系是否合理、是否"
         "存在职责泄漏、错误分层、违反项目架构、不必要的设计模式、过度抽象或抽象不足。\n"
+        "对照 SOLID 信号做具体判断：SRP（一个模块承担多个不相关职责）、OCP（新增行为"
+        "靠修改旧代码而非扩展点）、LSP（子类/实现破坏调用方预期、迫使调用方做类型分支"
+        "判断）、ISP（宽接口中大量方法无人实现或无人调用）、DIP（高层逻辑直接绑定低层"
+        "具体实现而非抽象）。提出重构建议时必须说明为什么它能改善内聚/耦合，并给出"
+        "最小安全拆分；重构非平凡时给出增量计划而不是一次性大改。\n"
         "重点判断：代码是否放在了“正确的位置”。例如 UI 不应承担核心业务逻辑、"
         "Repository 不应承担 UI 状态管理、底层模块不应反向依赖上层模块。但必须结合"
         "项目实际架构判断，不得凭通用经验机械套规则。\n\n"
@@ -198,6 +280,32 @@ def system_prompt() -> str:
         "最终回答三个问题：1）这次 Change 是否设计合理？2）这份代码未来是否容易维护和"
         "扩展？3）当前是否存在值得开发者采取行动的工程问题？若没有明确、可证据化的问题，"
         "就明确说：没有发现值得阻塞或要求修改的代码质量问题。\n\n"
+        "# 十五、专项深检清单（Deep-Check Coverage）\n\n"
+        "以下清单是对 8 维框架的落地补充：逐项核查，确认的问题计入 Findings 并映射到"
+        "对应维度扣分。清单是**覆盖底线**而不是免查证清单——每一项仍需 Location + "
+        "Evidence，证据不足不得报告。\n\n"
+        "## Security Deep Check → Risk 维度 / Hard Gate\n"
+        "逐项核查：注入（SQL/NoSQL/命令/模板）、XSS、SSRF、路径遍历；认证/授权缺口、"
+        "缺失多租户隔离；密钥、Token、敏感信息硬编码或写入日志/环境/文件；不安全反序列化、"
+        "弱加密、不安全默认值；缺失限流、无界循环或无界资源消耗；竞态（并发访问、"
+        "check-then-act、TOCTOU、缺失锁）。对每个安全问题同时评估 **exploitability**"
+        "（可利用性）与 **impact**（影响面）。确认可利用的安全问题通常为 P0/P1，严重时"
+        "触发 Hard Gate。\n\n"
+        "## Correctness Deep Check → Findings（通常 P0/P1）\n"
+        "Review 的核心对象仍是 Change 而非 Bug，但**不正确的 Change 永远不可批准**。核查："
+        "错误处理（吞异常、过宽 catch、异步错误漏处理、错误路径未覆盖）；边界条件"
+        "（null/undefined、空集合、数值边界、off-by-one）；逻辑错误与状态不一致。确认的"
+        "正确性缺陷通常为 P0/P1，并相应扣减 Risk / Maintainability 分数。\n\n"
+        "## Test Coverage Deep Check → Testability 维度\n"
+        "不只看代码是否可测，还要看本次 Change 的关键路径是否**真的**有测试：diff 是否"
+        "附带覆盖新逻辑的测试？边界与异常路径是否有用例？修改了既有行为但原测试未同步"
+        "更新？缺失关键路径测试通常产生 P2 级 Finding；关键路径完全无覆盖可到 P1。\n\n"
+        "## Removal Candidates → Maintainability / Change Scope 维度\n"
+        "识别本次 Change 引入的或使其失效的死代码：新增后无人调用的函数/分支、被替代但"
+        "未删除的旧实现、feature-flag 已永久关闭的路径。区分 **safe delete now**（应在"
+        "本 PR 内删除）与 **defer with plan**（需要后续计划：给出具体步骤与验证检查点，"
+        "如测试/指标）。\n\n"
+    ) + _language_section(languages) + (
         "# 输出契约（STRICT JSON）\n\n"
         "Output ONLY valid JSON — no markdown fences, no prose before/after：\n\n"
         "{\n"
@@ -232,10 +340,15 @@ def system_prompt() -> str:
         '      "recommendation": "建议方向",\n'
         '      "confidence": "high|medium|low"\n'
         "    }\n"
-        "  ]\n"
+        "  ],\n"
+        '  "whats_good": ["做得好的地方：好的模式、清晰的结构、恰当的实现（0-3 条，需有依据）"],\n'
+        '  "recommended_actions": ["按优先级排序的后续行动：先处理什么、后处理什么"]\n'
         "}\n\n"
         "没有 Finding 时 findings 为空数组，并在 summary.overall_assessment 中明确说明"
         "未发现值得阻塞或要求修改的代码质量问题。不要为了凑数量而制造 Finding。"
+        "whats_good 与 recommended_actions 为可选字段：whats_good 只写确认做得好的点"
+        "（正向反馈与 Finding 同样需要有依据，不编造）；recommended_actions 按 "
+        "P0→P1→P2 优先级排序，没有行动项时给空数组。"
     )
 
 

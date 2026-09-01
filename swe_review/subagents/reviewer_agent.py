@@ -153,6 +153,8 @@ class ReviewReport:
     scores: Dict[str, Any] = field(default_factory=dict)        # engineering style
     total_score: Optional[float] = None                         # engineering style
     hard_gate: Dict[str, Any] = field(default_factory=dict)     # engineering style
+    whats_good: List[str] = field(default_factory=list)          # engineering style (optional)
+    recommended_actions: List[str] = field(default_factory=list)  # engineering style (optional)
     parse_error: Optional[str] = None  # set when the model output was not parseable
     truncated_repair: bool = False  # JSON only parsed via truncation repair (tail lost)
     raw_response: str = ""
@@ -212,6 +214,8 @@ class ReviewReport:
             "scores": self.scores,
             "total_score": self.total_score,
             "hard_gate": self.hard_gate,
+            "whats_good": self.whats_good,
+            "recommended_actions": self.recommended_actions,
             "parse_error": self.parse_error,
             "truncated_repair": self.truncated_repair,
             "timestamp": self.timestamp,
@@ -567,7 +571,12 @@ class ReviewerSubAgent:
 
         # 3) Prompts
         if prompt_style == "engineering":
-            system_prompt = engineering_prompt.system_prompt()
+            # Trim the language-specific checklist (section 十六) to the
+            # languages actually present in the diff — fixed prompt token cost
+            # was flagged as a P3 finding in self-review.
+            system_prompt = engineering_prompt.system_prompt(
+                languages=engineering_prompt.detect_languages(pr_diff)
+            )
             user_prompt = engineering_prompt.user_prompt(
                 issue=issue,
                 pr_title=pr_title,
@@ -1122,6 +1131,15 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
 
     defects = [f.to_defect() for f in findings]
 
+    def _str_list(key: str) -> List[str]:
+        """Tolerate a bare string or a list for the optional engineering fields."""
+        raw = data.get(key) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [str(x) for x in raw if x]
+
     # Fallback: if the model occasionally answers in the legacy shape
     # (defects[] but no findings[]), preserve the feedback instead of
     # dropping it on the floor.
@@ -1146,6 +1164,8 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
         scores=scores,
         total_score=total_score,
         hard_gate=hard_gate,
+        whats_good=_str_list("whats_good"),
+        recommended_actions=_str_list("recommended_actions"),
         token_usage=token_usage,
         prompt_style="engineering",
     )
