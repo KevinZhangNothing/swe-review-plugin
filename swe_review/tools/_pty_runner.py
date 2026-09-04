@@ -186,10 +186,19 @@ def run_subprocess(
         )
         return p.stdout, p.stderr, p.returncode
     except subprocess.TimeoutExpired as e:
-        return (e.stdout or ""), (e.stderr or ""), -1
+        # CPython 在 TimeoutExpired 上可能回填 bytes（即使 text=True），
+        # 统一解码，避免下游 strip_ansi 等正则对 bytes 抛 TypeError。
+        out, err = e.stdout or "", e.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
+        return out, err, -1
 
 
-def strip_ansi(s: str) -> str:
+def strip_ansi(s) -> str:
+    if isinstance(s, bytes):
+        s = s.decode(errors="replace")
     # CSI: \x1b[ ... letter  (covers all private modes including >, =, ?, <)
     s = re.sub(r"\x1b\[[\?>=<][0-9;]*[a-zA-Z@`]?", "", s)
     # Plain CSI with no intermediate
