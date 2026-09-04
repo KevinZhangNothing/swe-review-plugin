@@ -112,7 +112,7 @@ flowchart TB
     START([Issue]) --> CHOOSE{strategy?}
 
     CHOOSE -->|review_guided| RG["Review‑Guided<br/><i>生成 → 审查 → 修订 → 验证</i>"]
-    CHOOSE -->|best_of_n| BON["Best‑of‑N<br/><i>生成 N 个 → 审查每个 → 选最优</i>"]
+    CHOOSE -->|best_of_n| BON["Best‑of‑N（swarm 式）<br/><i>并行 wave + 视角多样化<br/>+ 失败记忆 + 证据优先裁决</i>"]
     CHOOSE -->|hybrid| HY["Hybrid<br/><i>先 best_of_n(3)<br/>未通过 → review_guided</i>"]
 
     RG --> DONE([Done: LoopResult])
@@ -148,22 +148,34 @@ flowchart TB
     REVISED -->|No| FAIL
 ```
 
-### 2.3 Best-of-N
+### 2.3 Best-of-N（Swarm 式并行 wave）
 
 ```mermaid
-flowchart LR
-    START([Issue]) --> LOOP["for k = 1..N<br/>----------------<br/>GeneratorSubAgent → 候选 diff"]
-    LOOP --> REVIEW_EACH[ReviewerSubAgent<br/>审查每个候选]
-    REVIEW_EACH --> CHECK{approved?}
+flowchart TB
+    START([Issue]) --> EXP["Explorer 跑一次<br/><i>共享 exploration</i>"]
+    EXP --> WAVE1["Wave 1：并行生成 min(3,N) 个候选<br/><i>perspective 轮换：<br/>minimal → alternative → constraint_aware</i>"]
+    WAVE1 --> REV1["并行 review 每个候选<br/><i>错误隔离：单个失败不掀翻 wave</i>"]
+    REV1 --> ANY_OK{有 approved?}
 
-    CHECK -->|Yes| APPROVE_IMMED([✅ 立即 approve])
-    CHECK -->|No| NEXT{k < N?}
+    ANY_OK -->|No 且 k<N| WAVE2["Wave 2+：串行扩张<br/><i>携带批次间失败记忆 prior_failures</i>"]
+    WAVE2 --> REV1
 
-    NEXT -->|Yes| LOOP
-    NEXT -->|No| PICK_BEST["选 confidence 最高的<br/>VerifierSubAgent 验证"]
-
-    PICK_BEST --> DONE([Done])
+    ANY_OK -->|Yes| ADJ["Evidence-first 裁决：<br/>approved 候选按 confidence 依次 verify"]
+    ADJ --> VPASSED{verify passed?}
+    VPASSED -->|Yes| SUCCESS([✅ approved+verified])
+    VPASSED -->|No| NEXTC{还有 approved 候选?}
+    NEXTC -->|Yes| ADJ
+    NEXTC -->|No| TIEBREAK["rejected 候选 top-2 verify 排序<br/><i>verify-pass 不推翻 review 结论</i>"]
+    TIEBREAK --> REJECT([❌ reject<br/>返回证据最优 diff])
+    ANY_OK -->|No 且 k=N| TIEBREAK
 ```
+
+关键设计（源自 SWE-Gate 实证与 swarm 编排原则）：
+
+- **并行 wave + 共享探索**：Wave 1 的多个候选并行生成/评审，且所有候选复用**同一次** explorer 结果（此前每个候选各跑一次 explorer，纯冗余）。
+- **视角多样化**：同一 prompt 采样 N 次会产生高度相关的候选；改为每个候选注入不同 `perspective`（minimal / alternative / constraint_aware，后者主动满足错误语义、作用域泛化、生命周期清理、编码转义四类高危评审约束）。
+- **批次间失败记忆**：Wave 2+ 的生成会收到此前所有被拒候选的紧凑摘要（rationale + decision + top findings，不含 diff），避免重复已失败路径。
+- **Evidence-first 裁决**：approved 候选必须 verify 通过才算 success——review 的语言描述不再能单独决定结果；全部 approved 候选 verify 失败时，对 rejected 候选按 confidence 取 top-2 跑 verify 做证据排序，但 verify-pass **不推翻** review 的拒绝结论（功能测试通过 ≠ 可接受）。
 
 ### 2.4 Hybrid
 
@@ -297,6 +309,7 @@ classDiagram
         +str evidence
         +str recommendation
         +str confidence
+        +str constraint_category
     }
 
     class Defect {
@@ -481,7 +494,7 @@ flowchart LR
 
 | style | 定位 |
 |---|---|
-| `engineering`（默认） | **高级代码审查**：审查对象是 Change 而非 Bug。8 维度 100 分制评分（Design 20 / Maintainability 15 / Consistency 15 / Simplicity 10 / Readability 10 / Testability 10 / Risk 10 / Change Scope 10）+ P0–P4 证据绑定 findings + Hard Gate + 4 档决策（APPROVE / APPROVE_WITH_SUGGESTIONS / REQUEST_CHANGES / BLOCK）。先理解再评价，Project Convention > Generic Best Practice，禁止低价值评论。 |
+| `engineering`（默认） | **高级代码审查**：审查对象是 Change 而非 Bug。8 维度 100 分制评分（Design 20 / Maintainability 15 / Consistency 15 / Simplicity 10 / Readability 10 / Testability 10 / Risk 10 / Change Scope 10）+ P0–P4 证据绑定 findings + Hard Gate + 4 档决策（APPROVE / APPROVE_WITH_SUGGESTIONS / REQUEST_CHANGES / BLOCK）。先理解再评价，Project Convention > Generic Best Practice，禁止低价值评论。含 **Review-Constraint Deep Check**（SWE-Gate 启发）：对错误语义、Schema/元数据/类型、作用域泛化、生命周期清理、编码/转义五类高频评审约束定向核查，命中的 finding 标注 `constraint_category`（10 类 canonical 词表，prompt 与 parser 共享同一常量）。输出契约要求 **findings 先于 scores** 且各字段长度克制——输出被截断时丢失尾部的 scores 而不是 findings。 |
 | `concise` | legacy bug-fix-centric：判断 patch 是否修复 issue 根因。 |
 | `detailed` | legacy bug-fix-centric：Step 1→6 workflow + symptom-fix detection。 |
 
@@ -539,7 +552,7 @@ flowchart TB
 | `ClaudeCodeAdapter` | `claude` | `claude -p --output-format json` | ❌ |
 | `CursorAdapter` | `agent` | `agent --print --trust` | ❌ |
 | `OpenCodeAdapter` | `opencode` | `opencode run` | ❌ |
-| `PiAdapter` | `pi` | `pi --mode print -p --skill <path>` | ✅ → `~/.pi/agent/skills/` |
+| `PiAdapter` | `pi` | `pi --mode print -p --system-prompt ...`（系统提示替换 pi 默认 coding-assistant prompt，避免模型在 `--no-tools` 下仍输出 `<tool_call>`） | ✅ → `~/.pi/agent/skills/` |
 | `ShellTools` | (无) | 返回占位 JSON | ❌ |
 
 ---
@@ -678,6 +691,10 @@ flowchart LR
 | diff 必须可通过 `git apply` 校验 | `ReviserSubAgent._parse_response()` | `status = "failed"` |
 | Verifier 默认使用沙箱 | `VerifierSubAgent.__init__(sandbox=True)` | 污染用户工作区 |
 | Reviewer 输出必须是可解析 JSON | `ReviewerSubAgent._parse_response()` | fallback `request_changes` |
+| Reviewer 输出内容不得为“空心载荷”（scores 越界/大面积 null、findings 无证据） | `reviewer_agent._parse_engineering_payload()` sanity gate | 视为解析失败，触发 regen/repair 重试 |
+| 不可信 review（parse_error / truncated_repair / 空心）不得 approve | `LoopSubAgent` | approve 暂扣，进入 revise/扩张 |
+| best_of_n 的 success 必须 verify 通过 | `LoopSubAgent._run_best_of_n()` evidence-first 裁决 | verify 失败穿透到下一候选 |
+| best_of_n wave 内单候选异常不得掀翻整个 wave | `asyncio.gather(return_exceptions=True)` | 失败候选降级为不可信拒绝 |
 
 ### Verifier 沙箱流程
 
@@ -717,6 +734,7 @@ flowchart TB
 ## 10. 参考与许可
 
 - 论文：*SWE-Review: Closing the Loop on Issue Resolution with Agentic Code Review*（项目内 `SWE-Review-2607.06065.pdf`）
+- 论文：*SWE-Gate: Passing Functional Tests Is Not Enough for Software Engineering Agents*（arXiv:2609.04167；Review-Constraint Deep Check 与 evidence-first 裁决的设计依据）
 - Claude Code：`https://code.claude.com`
 - Cursor：`https://cursor.com`
 - OpenCode：`https://opencode.ai`

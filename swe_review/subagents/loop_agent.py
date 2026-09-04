@@ -37,6 +37,28 @@ def _unwrap_skill(out: Any) -> Dict[str, Any]:
     return d
 
 
+def _failure_summary(gen: Dict[str, Any], rev: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact per-candidate failure memory fed to later generation waves.
+
+    Deliberately excludes the full diff — approach rationale + review verdict
+    + top findings is enough to steer the next candidate away from a dead end
+    without blowing up the prompt.
+    """
+    findings = rev.get("findings") or rev.get("defects") or []
+    tops: List[str] = []
+    for f in findings[:3]:
+        if isinstance(f, dict):
+            sev = f.get("severity", "")
+            title = f.get("title") or f.get("description", "")
+            if title:
+                tops.append(f"{sev}:{title}"[:160])
+    return {
+        "approach": (gen.get("rationale") or "")[:300],
+        "review_decision": rev.get("decision", ""),
+        "top_findings": tops,
+    }
+
+
 @dataclass
 class LoopIteration:
     iteration: int
@@ -278,7 +300,19 @@ class LoopSubAgent:
         t0: datetime,
         prompt_style: Optional[str] = None,
     ) -> LoopResult:
-        """Generates N candidates, reviews each, returns first approved or highest-confidence."""
+        """Wave-based best-of-N (swarm-style).
+
+        Wave 1: min(3, n) perspective-diverse candidates generated and reviewed
+        IN PARALLEL over ONE shared exploration (previously each candidate ran
+        its own explorer — pure redundancy for the same repo + issue).
+        Wave 2+: serial expansion, one candidate at a time, fed a compact
+        failure memory of everything rejected so far.
+        Adjudication is evidence-first: an approved candidate only succeeds
+        when verify passes; review confidence is used for ordering, never as
+        a substitute for executable evidence.
+        """
+        from .generator_agent import PERSPECTIVE_ROTATION
+
         iterations: List[LoopIteration] = []
         token_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -290,58 +324,144 @@ class LoopSubAgent:
                 message="generator_skill is required for best_of_n",
             )
 
-        best = {"diff": "", "confidence": -1.0, "decision": "request_changes"}
-        for k in range(1, n + 1):
-            gen = await self._generate(issue, repo_path)
-            iterations.append(self._mk_iter(k, "generate", "n/a", gen.get("confidence", 0.5), 0,
-                                            notes=gen.get("rationale", "")))
-            cand = {"title": gen.get("title", ""),
-                    "body": gen.get("body", ""),
-                    "diff": gen.get("diff", "")}
-            rev = await self._review(issue, cand, repo_path,
-                                     prompt_style=prompt_style)
-            rev_unreliable = bool(rev.get("truncated_repair") or rev.get("parse_error"))
-            it = self._mk_iter(k, "review",
-                               rev.get("decision", "request_changes"),
-                               rev.get("confidence", 0.5), len(rev.get("defects", [])),
-                               token_usage=rev.get("token_usage"),
-                               notes=("untrusted review output; "
-                                      "approve withheld") if rev_unreliable else None)
-            it.review_payload = rev
-            iterations.append(it)
-            self._accum_tokens(token_total, rev.get("token_usage"))
-            if not rev_unreliable and rev.get("decision") in DECISION_APPROVING:
-                rr = await self._verify(cand, repo_path)
-                if rr:
-                    iterations.append(self._mk_iter(k, "verify",
-                                                    "approve" if rr["passed"] else "review_failed",
-                                                    rr["confidence"], 0, notes=rr["details"]))
-                return LoopResult(
-                    success=True, final_decision=rev.get("decision", "approve"),
-                    final_pr_diff=cand.get("diff", ""),
-                    total_iterations=len(iterations),
-                    iterations=iterations,
-                    resolve_rate=rr["resolve_rate"] if rr else 0.0,
-                    token_usage_total=token_total,
-                    strategy="best_of_n",
-                    message=f"approved on candidate {k}/{n}",
-                )
-            if rev.get("confidence", 0.0) > best["confidence"]:
-                best = {"diff": cand["diff"], "confidence": rev["confidence"], "decision": rev["decision"]}
+        # Shared exploration: run once, reused by every candidate.
+        explore_fn = getattr(self.generator_skill, "explore", None)
+        exploration = (await explore_fn(issue, repo_path)) if callable(explore_fn) else None
 
-        rr = await self._verify({"diff": best["diff"]}, repo_path) if best["diff"] else None
-        if rr:
-            iterations.append(self._mk_iter(len(iterations) + 1, "verify",
-                                            "approve" if rr["passed"] else "request_changes",
-                                            rr["confidence"], 0, notes=rr["details"]))
+        candidates: List[Dict[str, Any]] = []
+        prior_failures: List[Dict[str, Any]] = []
+
+        k = 0
+        while k < n:
+            wave = min(3, n) if k == 0 else 1
+            wave = min(wave, n - k)
+            gens_raw = await asyncio.gather(*[
+                self._generate(
+                    issue, repo_path,
+                    perspective=PERSPECTIVE_ROTATION[(k + j) % len(PERSPECTIVE_ROTATION)],
+                    # snapshot the memory: later waves keep appending to the
+                    # live list, and a shared reference would mutate what an
+                    # earlier call was recorded/awaited with
+                    prior_failures=list(prior_failures) if prior_failures else None,
+                    exploration=exploration,
+                )
+                for j in range(wave)
+            ], return_exceptions=True)
+            # Error isolation: one candidate's failure must not sink the wave
+            # (self-review P1). Failed generates become empty candidates that
+            # skip review; failed reviews become untrusted rejections.
+            gens: List[Dict[str, Any]] = [
+                g if not isinstance(g, Exception) else {
+                    "title": "", "body": "", "diff": "",
+                    "rationale": f"generate error: {g}", "confidence": 0.0,
+                }
+                for g in gens_raw
+            ]
+            prs = [{"title": g.get("title", ""), "body": g.get("body", ""),
+                    "diff": g.get("diff", "")} for g in gens]
+
+            async def _review_or_skip(pr: Dict[str, Any]) -> Dict[str, Any]:
+                if not pr.get("diff"):
+                    return {"decision": "request_changes", "confidence": 0.0,
+                            "defects": [], "findings": [],
+                            "parse_error": "skipped: empty generated diff",
+                            "token_usage": None}
+                return await self._review(issue, pr, repo_path,
+                                          prompt_style=prompt_style)
+
+            revs_raw = await asyncio.gather(
+                *[_review_or_skip(pr) for pr in prs], return_exceptions=True)
+            revs: List[Dict[str, Any]] = [
+                r if not isinstance(r, Exception) else {
+                    "decision": "request_changes", "confidence": 0.0,
+                    "defects": [], "findings": [],
+                    "parse_error": f"review error: {r}", "token_usage": None,
+                }
+                for r in revs_raw
+            ]
+            for j, (gen, pr, rev) in enumerate(zip(gens, prs, revs)):
+                idx = k + j + 1
+                iterations.append(self._mk_iter(
+                    idx, "generate", "n/a", gen.get("confidence", 0.5), 0,
+                    notes=gen.get("rationale", "")))
+                rev_unreliable = bool(rev.get("truncated_repair") or rev.get("parse_error"))
+                it = self._mk_iter(
+                    idx, "review", rev.get("decision", "request_changes"),
+                    rev.get("confidence", 0.5), len(rev.get("defects", [])),
+                    token_usage=rev.get("token_usage"),
+                    notes=("untrusted review output; "
+                           "approve withheld") if rev_unreliable else None)
+                it.review_payload = rev
+                iterations.append(it)
+                self._accum_tokens(token_total, rev.get("token_usage"))
+                approved = (not rev_unreliable
+                            and rev.get("decision") in DECISION_APPROVING)
+                candidates.append({
+                    "pr": pr, "idx": idx, "approved": approved,
+                    "decision": rev.get("decision", "request_changes"),
+                    "confidence": rev.get("confidence", 0.0),
+                })
+                if not approved:
+                    prior_failures.append(_failure_summary(gen, rev))
+            k += wave
+            if any(c["approved"] for c in candidates):
+                break  # progressive swarm: stop expanding once approvable
+
+        # ---- Adjudication: evidence-first ----
+        resolve_rate = 0.0
+        approved = sorted((c for c in candidates if c["approved"]),
+                          key=lambda c: -c["confidence"])
+        for c in approved:
+            rr = await self._verify(c["pr"], repo_path)
+            if rr:
+                iterations.append(self._mk_iter(
+                    len(iterations) + 1, "verify",
+                    "approve" if rr["passed"] else "review_failed",
+                    rr["confidence"], 0, notes=rr["details"]))
+                resolve_rate = max(resolve_rate, rr["resolve_rate"])
+            if rr and rr["passed"]:
+                return LoopResult(
+                    success=True, final_decision=c["decision"],
+                    final_pr_diff=c["pr"].get("diff", ""),
+                    total_iterations=len(iterations), iterations=iterations,
+                    resolve_rate=resolve_rate, token_usage_total=token_total,
+                    strategy="best_of_n",
+                    message=f"candidate {c['idx']}/{len(candidates)} approved+verified",
+                )
+
+        # No approved candidate survived verify. Evidence tie-break among the
+        # rejected: verify the top-2 by confidence; a verify-pass is recorded
+        # as the final diff but does NOT flip success (review was not passed).
+        rest = sorted((c for c in candidates if not c["approved"]),
+                      key=lambda c: -c["confidence"])
+        best_diff = rest[0]["pr"]["diff"] if rest else ""
+        for c in rest[:2]:
+            if not c["pr"].get("diff"):
+                continue
+            rr = await self._verify(c["pr"], repo_path)
+            if rr:
+                iterations.append(self._mk_iter(
+                    len(iterations) + 1, "verify",
+                    "approve" if rr["passed"] else "request_changes",
+                    rr["confidence"], 0, notes=rr["details"]))
+                resolve_rate = max(resolve_rate, rr["resolve_rate"])
+            if rr and rr["passed"]:
+                return LoopResult(
+                    success=False, final_decision="reject",
+                    final_pr_diff=c["pr"]["diff"],
+                    total_iterations=len(iterations), iterations=iterations,
+                    resolve_rate=resolve_rate, token_usage_total=token_total,
+                    strategy="best_of_n",
+                    message=(f"candidate {c['idx']} verify-passed but "
+                             "review-rejected; returning as evidence-ranked best"),
+                )
+
         return LoopResult(
             success=False, final_decision="reject",
-            final_pr_diff=best["diff"], total_iterations=len(iterations),
-            iterations=iterations,
-            resolve_rate=rr["resolve_rate"] if rr else 0.0,
-            token_usage_total=token_total,
-            strategy="best_of_n",
-            message=f"no candidate approved in {n}, picked highest confidence",
+            final_pr_diff=best_diff, total_iterations=len(iterations),
+            iterations=iterations, resolve_rate=resolve_rate,
+            token_usage_total=token_total, strategy="best_of_n",
+            message=f"no candidate approved+verified in {len(candidates)}",
         )
 
     # ==================================================================
@@ -430,13 +550,22 @@ class LoopSubAgent:
                     "status": d.get("status", "")}
         return None
 
-    async def _generate(self, issue: str, repo_path: Optional[str]) -> Dict[str, Any]:
+    async def _generate(
+        self, issue: str, repo_path: Optional[str],
+        perspective: Optional[str] = None,
+        prior_failures: Optional[List[Dict[str, Any]]] = None,
+        exploration: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         if not self.generator_skill:
             return {"title": "", "body": "", "diff": "", "rationale": "", "confidence": 0.0}
-        out = await self.generator_skill.execute(
-            issue=issue,
-            repo_path=repo_path,
-        )
+        kwargs: Dict[str, Any] = {"issue": issue, "repo_path": repo_path}
+        if perspective is not None:
+            kwargs["perspective"] = perspective
+        if prior_failures is not None:
+            kwargs["prior_failures"] = prior_failures
+        if exploration is not None:
+            kwargs["exploration"] = exploration
+        out = await self.generator_skill.execute(**kwargs)
         return _unwrap_skill(out)
 
     async def _verify(

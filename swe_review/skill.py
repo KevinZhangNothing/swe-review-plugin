@@ -241,24 +241,36 @@ class GenerateSkill:
         self.subagent = GeneratorSubAgent(tool_adapter=self.tool)
         self.explore_skill = explore_skill or ExploreSkill()
 
+    async def explore(self, issue: str, repo_path: Optional[str] = None) -> Dict[str, Any]:
+        """Run the explorer once so a loop can share the result across N candidates."""
+        if not repo_path:
+            return {}
+        ex = await self.explore_skill.execute(
+            issue=issue, repo_path=repo_path, max_steps=4
+        )
+        return ex.payload or {}
+
     async def execute(
         self,
         issue: str,
         hint: str = "",
         repo_path: Optional[str] = None,
+        perspective: Optional[str] = None,
+        prior_failures: Optional[list] = None,
+        exploration: Optional[Dict[str, Any]] = None,
     ) -> SkillResult:
-        exploration: Dict[str, Any] = {}
-        if repo_path:
-            ex = await self.explore_skill.execute(
-                issue=issue, repo_path=repo_path, max_steps=4
-            )
-            exploration = ex.payload or {}
+        # exploration=None → run our own explore (backward compatible);
+        # an explicit value (even {}) is used as-is so loops can share one.
+        if exploration is None:
+            exploration = await self.explore(issue=issue, repo_path=repo_path)
 
         res: GeneratedPR = await self.subagent.execute({
             "issue": issue,
             "hint": hint,
             "repo_path": repo_path,
             "exploration": exploration,
+            "perspective": perspective,
+            "prior_failures": prior_failures,
         })
         return SkillResult(ok=bool(res.diff), payload=res.to_dict(), raw=res)
 

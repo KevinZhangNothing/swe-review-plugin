@@ -104,6 +104,9 @@ class Finding:
     evidence: str = ""
     recommendation: str = ""
     confidence: str = "medium"  # "high" | "medium" | "low"
+    # Optional SWE-Gate review-constraint category tag (e.g. "scope_generalization");
+    # empty string when the finding maps to no constraint category.
+    constraint_category: str = ""
 
     def to_dict(self, deep: bool = False) -> Dict[str, Any]:
         loc = (_normalize_location_deep(self.location) if deep
@@ -117,6 +120,7 @@ class Finding:
             "evidence": self.evidence,
             "recommendation": self.recommendation,
             "confidence": self.confidence,
+            "constraint_category": self.constraint_category,
         }
 
     def to_defect(self) -> "Defect":
@@ -1078,6 +1082,10 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
                 str(f.get("confidence", "medium") or "medium").lower(),
                 ("high", "medium", "low"), "medium",
             ),
+            constraint_category=pick_enum(
+                str(f.get("constraint_category", "") or "").strip(),
+                engineering_prompt.CONSTRAINT_CATEGORIES, "",
+            ),
         ))
 
     scores_raw = data.get("scores", {}) or {}
@@ -1154,6 +1162,44 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
                 location=d.get("location", ""),
                 suggestion=d.get("suggestion", ""),
             ))
+
+    # Content-sanity gate: a structurally valid but hollow payload is as
+    # unusable as malformed JSON (observed in self-review: one finding with
+    # all evidence fields empty, 7/8 dimension scores null, one out-of-range
+    # score). Treat it as a parse failure so the regen/repair retries kick in
+    # and downstream keeps the report untrusted instead of revising on
+    # hallucinated feedback.
+    sanity_problems: List[str] = []
+    for dim, entry in scores.items():
+        v = entry.get("score")
+        if isinstance(v, (int, float)) and not (0 <= v <= entry["max"]):
+            sanity_problems.append(
+                f"{dim} score {v} out of range [0,{entry['max']}]")
+            entry["score"] = None  # out-of-range scores are not evidence
+    numeric_scores = sum(1 for e in scores.values()
+                         if isinstance(e.get("score"), (int, float)))
+    # Only enforce score completeness when the model ATTEMPTED scores (key
+    # present) but delivered mostly nulls/out-of-range — a minimal approve
+    # that omits the scores key entirely stays a valid legacy-tolerant answer.
+    if data.get("scores") and numeric_scores < 4:
+        sanity_problems.append(
+            f"only {numeric_scores}/{len(SCORE_DIMENSIONS)} dimension scores present")
+    if findings and all(not (f.observation or f.evidence) for f in findings):
+        sanity_problems.append("all findings lack observation/evidence")
+    if sanity_problems:
+        return ReviewReport(
+            decision=decision,
+            confidence=confidence,
+            summary=data.get("summary", {}) or {},
+            defects=defects,
+            findings=findings,
+            scores=scores,
+            total_score=None,
+            hard_gate=hard_gate,
+            token_usage=token_usage,
+            prompt_style="engineering",
+            parse_error="incomplete_content: " + "; ".join(sanity_problems),
+        )
 
     return ReviewReport(
         decision=decision,

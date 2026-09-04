@@ -1087,3 +1087,291 @@ def test_unparseable_review_retries_fresh_calls():
     assert len(stub.calls) == 4, f"expected 4 calls (2 attempts x original+repair), got {len(stub.calls)}"
     assert report.parse_error is None
     assert report.decision == "approve"
+
+
+# ======================================================================
+# best_of_n swarm rework: parallel waves + perspectives + failure memory
+# + evidence-first adjudication
+# ======================================================================
+
+def _fake_gen_skill(gens):
+    """gens: list of payload dicts returned in call order."""
+    class FakeGenSkill:
+        def __init__(self):
+            self.calls = []
+            self.explore_calls = 0
+
+        async def explore(self, issue, repo_path=None):
+            self.explore_calls += 1
+            return {"shared": True}
+
+        async def execute(self, **kw):
+            self.calls.append(kw)
+            payload = gens[min(len(self.calls), len(gens)) - 1]
+            return {"ok": True, "payload": payload, "raw": None, "message": ""}
+
+    return FakeGenSkill()
+
+
+def _fake_review_skill(decisions):
+    """decisions: list of (decision, confidence) returned in call order."""
+    class FakeReviewSkill:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, **kw):
+            d, c = decisions[min(self.calls, len(decisions) - 1)]
+            self.calls += 1
+            return {"ok": True,
+                    "payload": {"decision": d, "confidence": c,
+                                "defects": [], "findings": [],
+                                "token_usage": None},
+                    "raw": None, "message": ""}
+
+    return FakeReviewSkill()
+
+
+def _fake_verify_skill(pass_diffs):
+    """pass_diffs: set of diffs that verify as passed."""
+    class FakeVerifySkill:
+        def __init__(self):
+            self.verified = []
+
+        async def execute(self, pr_diff="", **kw):
+            self.verified.append(pr_diff)
+            ok = pr_diff in pass_diffs
+            return {"ok": True,
+                    "payload": {"passed": ok, "confidence": 0.9 if ok else 0.1,
+                                "details": "fake verify",
+                                "patch_applied": True,
+                                "resolution_status": "resolved" if ok else "failed"},
+                    "raw": None, "message": ""}
+
+    return FakeVerifySkill()
+
+
+def _gen_payload(diff, rationale="fix", confidence=0.5):
+    return {"title": "t", "body": "b", "diff": diff,
+            "rationale": rationale, "confidence": confidence}
+
+
+def test_best_of_n_verify_fail_falls_through_to_next_approved_candidate():
+    """Bug fix: previously an approved candidate returned success=True even
+    when verify FAILED. Now a failed verify falls through to the next
+    approved candidate."""
+    import asyncio
+    from swe_review.subagents.loop_agent import LoopSubAgent
+
+    gen = _fake_gen_skill([_gen_payload("d1"), _gen_payload("d2")])
+    rev = _fake_review_skill([("approve", 0.9), ("approve", 0.8)])
+    ver = _fake_verify_skill({"d2"})  # d1 (higher confidence) fails verify
+
+    loop = LoopSubAgent(review_skill=rev, generator_skill=gen,
+                        verifier_skill=ver, strategy="best_of_n")
+    r = asyncio.run(loop.execute(
+        {"issue": "x", "strategy": "best_of_n", "n_best_of": 2}))
+    assert r.success is True
+    assert r.final_pr_diff == "d2"
+    assert ver.verified == ["d1", "d2"]  # evidence-first ordering by confidence
+    assert "approved+verified" in r.message
+
+
+def test_best_of_n_rejected_candidates_verify_tiebreak():
+    """No approvals: verify top-2 by confidence as evidence tie-break; a
+    verify-pass does NOT flip success (review gate stands) but becomes the
+    returned diff."""
+    import asyncio
+    from swe_review.subagents.loop_agent import LoopSubAgent
+
+    gen = _fake_gen_skill([_gen_payload("d1"), _gen_payload("d2"),
+                           _gen_payload("d3")])
+    rev = _fake_review_skill([("request_changes", 0.9),
+                              ("request_changes", 0.6),
+                              ("request_changes", 0.7)])
+    ver = _fake_verify_skill({"d3"})
+
+    loop = LoopSubAgent(review_skill=rev, generator_skill=gen,
+                        verifier_skill=ver, strategy="best_of_n")
+    r = asyncio.run(loop.execute(
+        {"issue": "x", "strategy": "best_of_n", "n_best_of": 3}))
+    assert r.success is False
+    assert r.final_decision == "reject"
+    # top-2 by confidence are d1 (0.9) then d3 (0.7); d3 verify-passes
+    assert r.final_pr_diff == "d3"
+    assert "verify-passed but review-rejected" in r.message
+
+
+def test_best_of_n_wave1_parallel_perspectives_and_shared_exploration():
+    """Wave 1 must fan out with rotating perspectives over ONE shared
+    exploration (not one explorer run per candidate)."""
+    import asyncio
+    from swe_review.subagents.loop_agent import LoopSubAgent
+
+    gen = _fake_gen_skill([_gen_payload("d1"), _gen_payload("d2"),
+                           _gen_payload("d3")])
+    rev = _fake_review_skill([("approve", 0.9)] * 3)
+    ver = _fake_verify_skill({"d1"})
+
+    loop = LoopSubAgent(review_skill=rev, generator_skill=gen,
+                        verifier_skill=ver, strategy="best_of_n")
+    r = asyncio.run(loop.execute(
+        {"issue": "x", "strategy": "best_of_n", "n_best_of": 3}))
+    assert r.success is True
+    assert gen.explore_calls == 1
+    perspectives = [c.get("perspective") for c in gen.calls]
+    assert perspectives == ["minimal", "alternative", "constraint_aware"]
+    # shared exploration object reached every candidate
+    assert all(c.get("exploration") == {"shared": True} for c in gen.calls)
+    # wave 1 has no failure memory
+    assert all(c.get("prior_failures") is None for c in gen.calls)
+
+
+def test_best_of_n_second_wave_carries_failure_memory():
+    """Wave 2 (serial expansion) must receive a compact summary of every
+    candidate rejected in wave 1."""
+    import asyncio
+    from swe_review.subagents.loop_agent import LoopSubAgent
+
+    gen = _fake_gen_skill([_gen_payload(f"d{i}", rationale=f"approach {i}")
+                           for i in range(1, 5)])
+    rev = _fake_review_skill([("request_changes", 0.5)] * 4)
+    ver = _fake_verify_skill(set())
+
+    loop = LoopSubAgent(review_skill=rev, generator_skill=gen,
+                        verifier_skill=ver, strategy="best_of_n")
+    r = asyncio.run(loop.execute(
+        {"issue": "x", "strategy": "best_of_n", "n_best_of": 4}))
+    assert r.success is False
+    assert len(gen.calls) == 4  # 3 in wave 1 + 1 serial expansion
+    pf = gen.calls[3].get("prior_failures")
+    assert pf is not None and len(pf) == 3
+    assert all("approach" in f and "review_decision" in f for f in pf)
+    # expansion uses the rotated perspective too
+    assert gen.calls[3].get("perspective") == "minimal"
+
+
+def test_generator_perspective_and_failure_memory_prompts():
+    """Perspective directive lands in the system prompt; failure memory lands
+    in the user prompt; defaults keep prompts unchanged."""
+    from swe_review.subagents.generator_agent import (
+        GeneratorSubAgent, PERSPECTIVES)
+
+    g = GeneratorSubAgent()
+    base_sys = g._system_prompt()
+    assert base_sys == g._system_prompt(perspective=None)
+    for key, directive in PERSPECTIVES.items():
+        assert directive in g._system_prompt(perspective=key)
+    assert "unknown" not in g._system_prompt(perspective="unknown") or \
+        g._system_prompt(perspective="unknown") == base_sys
+
+    base_usr = g._user_prompt("i", "", None, {})
+    assert "Previously Rejected Approaches" not in base_usr
+    usr = g._user_prompt("i", "", None, {},
+                         prior_failures=[{"approach": "patched parser",
+                                          "review_decision": "request_changes",
+                                          "top_findings": ["P1:too broad"]}])
+    assert "Previously Rejected Approaches" in usr
+    assert "patched parser" in usr
+
+
+def test_engineering_hollow_payload_flagged_as_parse_error():
+    """Self-review finding: a structurally valid but hollow payload (scores
+    attempted but mostly null, out-of-range score, findings with empty
+    evidence) must be treated as a parse failure so regen/repair retries and
+    the loop's trust gate engage."""
+    from swe_review.subagents.reviewer_agent import _parse_engineering_payload
+
+    hollow = {
+        "decision": "REQUEST_CHANGES", "confidence": 0.5,
+        "summary": {"problem": "x"},
+        "findings": [{"severity": "P1", "title": "hallucinated",
+                      "location": "a.py:1", "observation": "",
+                      "evidence": ""}],
+        "scores": {"readability": {"score": 80, "max": 10},
+                   "risk": {"score": None}},
+    }
+    rep = _parse_engineering_payload(hollow, None)
+    assert rep.parse_error and "incomplete_content" in rep.parse_error
+    assert rep.scores["readability"]["score"] is None  # out-of-range nulled
+    assert rep.total_score is None
+
+    # minimal approve WITHOUT scores key stays valid (legacy tolerance)
+    minimal = {"decision": "APPROVE", "confidence": 0.9,
+               "summary": {}, "findings": []}
+    rep2 = _parse_engineering_payload(minimal, None)
+    assert rep2.parse_error is None
+
+    # full healthy payload passes
+    healthy = {"decision": "APPROVE", "confidence": 0.9, "summary": {},
+               "findings": [],
+               "scores": {d: {"score": 1, "max": m, "reason": "r"}
+                          for d, m in
+                          [("design_quality", 20), ("maintainability", 15),
+                           ("consistency", 15), ("simplicity", 10),
+                           ("readability", 10), ("testability", 10),
+                           ("risk", 10), ("change_scope", 10)]},
+               "total_score": 8}
+    rep3 = _parse_engineering_payload(healthy, None)
+    assert rep3.parse_error is None
+    assert rep3.total_score == 8.0
+
+
+def test_best_of_n_wave_survives_candidate_exceptions():
+    """Self-review P1: a raising generate/review must not sink the wave —
+    the surviving approved candidate still wins."""
+    import asyncio
+    from swe_review.subagents.loop_agent import LoopSubAgent
+
+    class FlakyGenSkill:
+        async def explore(self, issue, repo_path=None):
+            return {}
+
+        async def execute(self, **kw):
+            if kw.get("perspective") == "alternative":
+                raise RuntimeError("boom")
+            return {"ok": True, "payload": _gen_payload("good-diff"),
+                    "raw": None, "message": ""}
+
+    class FlakyReviewSkill:
+        async def execute(self, **kw):
+            return {"ok": True,
+                    "payload": {"decision": "approve", "confidence": 0.9,
+                                "defects": [], "findings": [],
+                                "token_usage": None},
+                    "raw": None, "message": ""}
+
+    ver = _fake_verify_skill({"good-diff"})
+    loop = LoopSubAgent(review_skill=FlakyReviewSkill(),
+                        generator_skill=FlakyGenSkill(),
+                        verifier_skill=ver, strategy="best_of_n")
+    r = asyncio.run(loop.execute(
+        {"issue": "x", "strategy": "best_of_n", "n_best_of": 3}))
+    assert r.success is True
+    assert r.final_pr_diff == "good-diff"
+    # the failed candidate is recorded, not fatal
+    gen_iters = [i for i in r.iterations if i.phase == "generate"]
+    assert any("generate error" in (i.notes or "") for i in gen_iters)
+
+
+def test_constraint_category_normalized_against_canonical_list():
+    """Self-review P2: parser normalizes unknown constraint_category to ''
+    using the same constant the prompt advertises."""
+    from swe_review.subagents.reviewer_agent import _parse_engineering_payload
+    from swe_review.subagents.engineering_prompt import (
+        CONSTRAINT_CATEGORIES, system_prompt)
+
+    assert "scope_generalization" in CONSTRAINT_CATEGORIES
+    for cat in CONSTRAINT_CATEGORIES:
+        assert cat in system_prompt(["Python"])
+
+    def parse(cat):
+        return _parse_engineering_payload(
+            {"decision": "REQUEST_CHANGES", "confidence": 0.5,
+             "findings": [{"severity": "P1", "title": "t", "location": "a:1",
+                           "observation": "o", "evidence": "e",
+                           "constraint_category": cat}]},
+            None).findings[0].constraint_category
+
+    assert parse("scope_generalization") == "scope_generalization"
+    assert parse("made_up_category") == ""
+    assert parse("") == ""

@@ -106,16 +106,22 @@ class PiAdapter:
         if self.auto_install_skills:
             await self.install_skills()
 
-        full_prompt = (
-            f"{system}\n\n{user}\n\n"
-            "IMPORTANT: Output ONLY valid JSON. No prose, no markdown fences."
-        )
-
+        # --system-prompt 替换 pi 默认的 coding-assistant 系统提示（那个提示会介绍
+        # read/bash/edit/write 工具——即使 --no-tools 禁用了工具，模型看到工具说明
+        # 仍会输出 <tool_call> 文本块；实测 deepseek 后端反复如此）。
         # 不加 --model：模型选择交给 pi 自身配置（设计原则）。
         # --no-tools：subagent 是纯文本生成（探索由本地 ExplorerSubAgent 完成）。
         # 若放开 write/edit/bash，review 子进程会真的改动目标仓库 —— 实测曾把
         # baseline worktree 改成 PR 应用后的状态，污染后续 verify 的 patch apply。
-        argv = [self.cli_path, "--mode", "print", "--no-tools", "-p", full_prompt]
+        argv = [
+            self.cli_path, "--mode", "print", "--no-tools",
+            "--system-prompt", system,
+            "-p",
+            user + "\n\nIMPORTANT: Output ONLY valid JSON. No prose, no markdown "
+                   "fences. Tools are DISABLED in this session: do NOT emit "
+                   "<tool_call> blocks, todo lists, or any function calls — "
+                   "answer directly with the JSON object as your entire response.",
+        ]
 
         env = {"PI_NO_TUI": "1"}
         out, err, rc = run_subprocess(argv, timeout=self.timeout, extra_env=env)
@@ -126,7 +132,7 @@ class PiAdapter:
                 f"pi --mode print failed (rc={rc}). stderr_tail={err_tail!r}"
             )
         text = strip_fences(text_clean)
-        tok = extract_tokens_from_text(text, full_prompt)
+        tok = extract_tokens_from_text(text, f"{system}\n{user}")
         return text, tok
 
     async def review(self, issue, pr_diff, repo_context=None):
