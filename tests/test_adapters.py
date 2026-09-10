@@ -42,8 +42,6 @@ def test_adapters_share_chat_signature():
     """All concrete adapters must implement `chat(system, user)` returning (str, dict)."""
     for cls in (ClaudeCodeAdapter, CursorAdapter, OpenCodeAdapter, PiAdapter, ShellTools):
         assert hasattr(cls, "chat")
-        assert hasattr(cls, "review")
-        assert hasattr(cls, "revise")
 
 
 def test_pi_install_skills_is_symlink_safe(tmp_path):

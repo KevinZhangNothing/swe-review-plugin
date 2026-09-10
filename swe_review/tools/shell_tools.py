@@ -30,17 +30,11 @@ class ShellTools:
         }
         text = json.dumps(fallback_response, ensure_ascii=False)
         tok = {
-            "prompt_tokens": len(system) + len(user) // 4,
+            "prompt_tokens": (len(system) + len(user)) // 4,
             "completion_tokens": 0,
             "total_tokens": (len(system) + len(user)) // 4,
         }
         return text, tok
-
-    async def review(self, issue, pr_diff, repo_context=None):
-        return await self.chat("system", f"{issue}\n{pr_diff}")
-
-    async def revise(self, issue, original_pr_diff, review_feedback):
-        return await self.chat("system", f"{issue}\n{review_feedback}")
 
     def get_status(self) -> Dict[str, Any]:
         return {"name": self.name, "configured": True, "backend": "shell-placeholder"}

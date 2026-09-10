@@ -45,6 +45,7 @@ CONSTRAINT_CATEGORIES: tuple = (
     "missing_vs_empty_sentinel",
     "performance_structure",
     "idempotence",
+    "simplicity_overengineering",
 )
 
 _EXT_TO_LANGUAGE = {
@@ -65,6 +66,35 @@ _DIFF_GIT_QUOTED_RE = re.compile(r'"b/([^"]+)"\s*$')
 _DIFF_GIT_BARE_RE = re.compile(r'\sb/(\S+)\s*$')
 
 
+def parse_diff_files(pr_diff: str) -> List[str]:
+    """Unique file paths touched by a unified diff (quoted paths and
+    rename-only entries tolerated, ``/dev/null`` skipped)."""
+    files: List[str] = []
+    for line in pr_diff.splitlines():
+        path = None
+        m = _DIFF_PATH_RE.match(line)
+        if m:
+            path = m.group(2)
+        elif line.startswith("diff --git "):
+            m2 = _DIFF_GIT_QUOTED_RE.search(line) or _DIFF_GIT_BARE_RE.search(line)
+            if m2:
+                path = m2.group(1)
+        if path and path != "/dev/null" and path not in files:
+            files.append(path)
+    return files
+
+
+def strip_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```json"):
+        s = s[7:]
+    elif s.startswith("```"):
+        s = s[3:]
+    if s.endswith("```"):
+        s = s[:-3]
+    return s.strip()
+
+
 def detect_languages(pr_diff: str) -> List[str]:
     """Detect checklist languages from a diff's file paths.
 
@@ -75,18 +105,7 @@ def detect_languages(pr_diff: str) -> List[str]:
     "trim to fallback only" (default) or "include everything".
     """
     langs: List[str] = []
-    for line in pr_diff.splitlines():
-        path = None
-        m = _DIFF_PATH_RE.match(line)
-        if m:
-            path = m.group(2)
-        elif line.startswith("diff --git "):
-            # rename-only entries carry no +++/--- lines; take the b/ side
-            m2 = _DIFF_GIT_QUOTED_RE.search(line) or _DIFF_GIT_BARE_RE.search(line)
-            if m2:
-                path = m2.group(1)
-        if not path or path == "/dev/null":
-            continue
+    for path in parse_diff_files(pr_diff):
         lang = _EXT_TO_LANGUAGE.get(os.path.splitext(path)[1].lower())
         if lang and lang not in langs:
             langs.append(lang)
@@ -334,6 +353,13 @@ def system_prompt(languages: Optional[Iterable[str]] = None) -> str:
         "路径上是否清理一致（连接、句柄、订阅、临时文件、缓存状态）。\n"
         "- **Encoding / Escaping / Quoting**（→ Correctness）：字符串编码、转义、引号边界的"
         "处理在变更后是否仍然正确。\n"
+        "- **Simplicity Ladder / Over-engineering**（→ Simplicity / Design / Change Scope）：对 "
+        "diff 中每个**新增**的抽象层、接口、helper、依赖、配置项逐级走阶梯：(1) 它是否真实"
+        "需要——投机性需求（YAGNI）应删除；(2) 仓库中是否已有等价实现——有则复用而非新写；"
+        "(3) 标准库是否已提供——用标准库而非手写；(4) 平台原生能力是否已覆盖；(5) 已安装依赖"
+        "是否已解决——不得为几行代码新增依赖；(6) 能否一行表达；(7) 仅当以上都不成立时才接受"
+        "新增代码，且应为可工作的最少代码。确认的违规计入 Findings，recommendation 必须指明"
+        "具体替代物（删除 / 标准库函数名 / 仓库中已有 helper 名），不允许只写“可以更简单”。\n"
         "每项仍需 Location + Evidence，证据不足不得报告；命中任一类别的 Finding 应在输出"
         "的 constraint_category 字段标注对应类别标签。\n\n"
         "## Removal Candidates → Maintainability / Change Scope 维度\n"

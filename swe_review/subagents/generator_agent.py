@@ -14,7 +14,7 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
 
 
-from .engineering_prompt import truncate_json_text
+from .engineering_prompt import strip_fences, truncate_json_text
 
 
 # Candidate-generation perspectives for best_of_n diversity (swarm principle:
@@ -22,7 +22,10 @@ from .engineering_prompt import truncate_json_text
 PERSPECTIVES: Dict[str, str] = {
     "minimal": (
         "Perspective: MINIMAL FIX. Prefer the smallest possible change that resolves the "
-        "issue — fewest files, fewest lines, no speculative generalization."
+        "issue — fewest files, fewest lines, no speculative generalization. For every new "
+        "helper/abstraction/dependency you consider adding, walk the ladder first: does it "
+        "need to exist at all? does the repo already have an equivalent? does the standard "
+        "library ship it? is it one line? Only add new code when all of those fail."
     ),
     "alternative": (
         "Perspective: ALTERNATIVE PATH. Deliberately look for a different implementation "
@@ -153,7 +156,7 @@ class GeneratorSubAgent:
         return "{}", {}
 
     def _parse(self, response: str) -> GeneratedPR:
-        cleaned = _strip_fences(response)
+        cleaned = strip_fences(response)
         try:
             data = json.loads(cleaned)
             diff = data.get("diff", "") or ""
@@ -176,14 +179,3 @@ class GeneratorSubAgent:
 
     def get_status(self) -> Dict[str, Any]:
         return {"name": self.name, "type": "generator", "capabilities": self.capabilities}
-
-
-def _strip_fences(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```json"):
-        s = s[7:]
-    elif s.startswith("```"):
-        s = s[3:]
-    if s.endswith("```"):
-        s = s[:-3]
-    return s.strip()

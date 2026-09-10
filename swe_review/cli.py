@@ -172,7 +172,6 @@ async def _cmd_loop(args) -> None:
         n_best_of=args.n_best_of,
         prompt_style=args.prompt_style,
         revision_feedback_level=args.feedback_level,
-        deep=args.deep,
     )
     _emit(res.payload)
 
@@ -257,8 +256,6 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["engineering", "concise", "detailed"])
     p_loop.add_argument("--feedback-level", default="full_feedback",
                         choices=["full_feedback", "minimal_feedback", "baseline"])
-    p_loop.add_argument("--deep", action="store_true",
-                        help="Emit nested review schema in loop iterations.")
     p_loop.add_argument("--initial-pr-diff", default=None,
                         help="path or '-' to an existing candidate diff; "
                              "when given, the loop reviews/revises it instead of "

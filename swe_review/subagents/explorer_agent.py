@@ -22,6 +22,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from .engineering_prompt import parse_diff_files
+
 
 @dataclass
 class ExplorationResult:
@@ -82,7 +84,7 @@ class ExplorerSubAgent:
         result = ExplorationResult(repo_path=str(self.repo_path) if self.repo_path else None)
 
         # 1) diff → 修改文件
-        result.files_modified = self._parse_modified_files(pr_diff)
+        result.files_modified = parse_diff_files(pr_diff)
         if focus_files:
             for f in focus_files:
                 if f not in result.files_modified:
@@ -125,17 +127,6 @@ class ExplorerSubAgent:
         return result
 
     # ------------------------------------------------------------------
-    def _parse_modified_files(self, pr_diff: str) -> List[str]:
-        files: List[str] = []
-        for line in pr_diff.split("\n"):
-            if line.startswith("diff --git"):
-                parts = line.split()
-                if len(parts) >= 3:
-                    f = parts[2].removeprefix("a/").removeprefix("b/")
-                    if f not in files:
-                        files.append(f)
-        return files
-
     def _extract_keywords(self, issue: str) -> List[str]:
         if not issue:
             return []
@@ -176,7 +167,7 @@ class ExplorerSubAgent:
                         rel = str(Path(fp).relative_to(self.repo_path))
                     except ValueError:
                         rel = fp
-                    if rel not in related and rel not in self._parse_modified_files(""):  # ok
+                    if rel not in related:
                         related.append(rel)
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 continue

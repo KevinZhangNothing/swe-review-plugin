@@ -4,17 +4,15 @@
 
 > 论文 §3.1: *"The reviewer does not receive the golden patch or hidden test results."*
 
-代码层强制：
+代码层强制（`generator_agent.py:GeneratorSubAgent.execute` 与
+`reviser_agent.py:ReviserSubAgent.execute` 入口均有同样的守卫）：
 ```python
-# swe_review/subagents/reviewer_agent.py:ReviserSubAgent.execute
-for forbidden in ("golden_patch", "test_info"):
+for forbidden in ("golden_patch", "gold_patch", "oracle", "test_info"):
     if forbidden in context:
         raise ValueError(...)
 ```
 
-`ReviserSubAgent` 与 `GeneratorSubAgent` 也同样：
-- `golden_patch` / `gold_patch` → ValueError
-- `oracle` / `test_info` → ValueError
+命中的字段一律 ValueError：
 
 Verifier **可以**接收 oracle，因为它跑在 review 链路外，只做分数聚合。
 

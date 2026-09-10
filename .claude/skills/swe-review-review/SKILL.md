@@ -116,7 +116,10 @@ empty when the model has nothing evidence-backed to say.
 Coverage beyond the 8 dimensions is enforced via deep-check checklists inside the prompt:
 security (injection/XSS/SSRF/authZ/secrets/crypto/race), correctness (error handling,
 boundary conditions), actual test coverage of changed paths, removal/dead-code
-candidates (safe-delete vs defer-with-plan), SOLID smells, and language-specific checks
+candidates (safe-delete vs defer-with-plan), SOLID smells, a simplicity ladder for every
+new abstraction/helper/dependency in the diff (needed at all? repo already has it? stdlib
+ships it? one line? — violations are tagged `constraint_category=simplicity_overengineering`
+and must name the concrete replacement), and language-specific checks
 (JS/TS, Python, Go, Rust, SQL — auto-trimmed to the languages present in the diff to
 control fixed prompt token cost).
 

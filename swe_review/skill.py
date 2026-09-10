@@ -8,7 +8,7 @@ Skill 层 - 高级、能力化的封装（区别于 SubAgent 的执行单元）
 """
 
 import asyncio
-from typing import Dict, Any, Optional, List, Callable, Awaitable
+from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
 
 from .subagents.reviewer_agent import (
@@ -331,7 +331,6 @@ class LoopSkill:
         n_best_of: Optional[int] = None,
         prompt_style: Optional[str] = None,
         revision_feedback_level: Optional[str] = None,
-        deep: bool = False,
     ) -> SkillResult:
         ctx = {
             "issue": issue,
@@ -344,11 +343,4 @@ class LoopSkill:
             "revision_feedback_level": revision_feedback_level or self.revision_feedback_level,
         }
         res: LoopResult = await self.subagent.execute(ctx)
-        # If deep=True and the final result includes review payloads, callers want nested schema;
-        # we re-emit review payloads if present in iterations[].
-        payload = res.to_dict()
-        if deep:
-            for it in payload.get("iterations", []):
-                # iteration notes may include review JSON in raw form; skip deep here.
-                pass
-        return SkillResult(ok=res.success, payload=payload, raw=res)
+        return SkillResult(ok=res.success, payload=res.to_dict(), raw=res)

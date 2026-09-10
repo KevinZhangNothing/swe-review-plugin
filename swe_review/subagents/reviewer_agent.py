@@ -36,7 +36,7 @@ from datetime import datetime
 
 from . import engineering_prompt
 from .analyzer_agent import detect_repeated_added_blocks
-from .engineering_prompt import truncate_json_text
+from .engineering_prompt import parse_diff_files, strip_fences, truncate_json_text
 
 
 # Defect severity & category enumerations
@@ -694,15 +694,9 @@ class ReviewerSubAgent:
         return ctx, steps
 
     def _static_diff_context(self, pr_diff: str) -> Dict[str, Any]:
-        files = []
-        for line in pr_diff.split("\n"):
-            if line.startswith("diff --git"):
-                parts = line.split()
-                if len(parts) >= 3:
-                    files.append(parts[2].removeprefix("a/").removeprefix("b/"))
         return {
             "repo_path": None,
-            "files_modified": files,
+            "files_modified": parse_diff_files(pr_diff),
             "keywords": [],
             "exploration_steps": 0,
             "note": "explorer not injected; only diff context used",
@@ -770,7 +764,7 @@ class ReviewerSubAgent:
         raise last_exc
 
     def _parse_response(self, response, token_usage, prompt_style):
-        data, repaired = _best_effort_json(_strip_fences(response))
+        data, repaired = _best_effort_json(strip_fences(response))
         if data is None or not isinstance(data, dict):
             return ReviewReport(
                 decision="request_changes",
@@ -836,17 +830,6 @@ class ReviewerSubAgent:
             "tool_adapter": type(self.tool_adapter).__name__ if self.tool_adapter else None,
             "explorer": type(self.explorer).__name__ if self.explorer else None,
         }
-
-
-def _strip_fences(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```json"):
-        s = s[7:]
-    elif s.startswith("```"):
-        s = s[3:]
-    if s.endswith("```"):
-        s = s[:-3]
-    return s.strip()
 
 
 # ---------------------------------------------------------------------------

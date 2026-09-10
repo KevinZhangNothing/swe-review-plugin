@@ -16,7 +16,7 @@ When you need a fresh candidate PR for an issue, typically before a `review_guid
 1. `diff` MUST be `git apply`-compatible unified diff.
 2. Output JSON only: `{title, body, diff, rationale, confidence}`.
 3. No oracle / golden patch injection — the generator sees only `issue`, optional `hint`, optional repo exploration.
-4. Keep changes minimal; do not refactor unrelated code.
+4. Keep changes minimal; do not refactor unrelated code. The `minimal` perspective walks a simplicity ladder before adding anything: needed at all? repo already has an equivalent? stdlib ships it? one line? New code only when all fail.
 
 ## How to invoke
 

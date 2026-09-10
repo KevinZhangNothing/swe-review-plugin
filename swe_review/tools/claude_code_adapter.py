@@ -95,24 +95,6 @@ class ClaudeCodeAdapter:
 
         return text, tok
 
-    async def review(self, issue, pr_diff, repo_context=None):
-        system = "You are an expert code reviewer. Output JSON only."
-        user = (
-            f"Issue:\n{issue}\n\nPR Diff:\n```diff\n{pr_diff}\n```\n\n"
-            f"Context:\n{json.dumps(repo_context or {}, ensure_ascii=False)}\n\n"
-            "Return JSON: {decision, confidence, summary, defects[]}."
-        )
-        return await self.chat(system=system, user=user)
-
-    async def revise(self, issue, original_pr_diff, review_feedback):
-        system = "You are a code revision expert. Output JSON only."
-        user = (
-            f"Issue:\n{issue}\n\nOriginal Diff:\n```diff\n{original_pr_diff}\n```\n\n"
-            f"Feedback:\n{json.dumps(review_feedback, ensure_ascii=False, indent=2)}\n\n"
-            "Return JSON: {title, body, diff, changes_summary, addressed_defect_indices[]}."
-        )
-        return await self.chat(system=system, user=user)
-
     def get_status(self) -> Dict[str, Any]:
         return {
             "name": self.name,

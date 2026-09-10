@@ -113,8 +113,14 @@ class PiAdapter:
         # --no-tools：subagent 是纯文本生成（探索由本地 ExplorerSubAgent 完成）。
         # 若放开 write/edit/bash，review 子进程会真的改动目标仓库 —— 实测曾把
         # baseline worktree 改成 PR 应用后的状态，污染后续 verify 的 patch apply。
+        # --no-extensions/-skills/-context-files/-prompt-templates/-themes：
+        # pi 默认注入的 Magic Context/tokensave 工具文档会让 deepseek 后端在
+        # 大 prompt 下稳定输出 <tool_call>（如 ctx_reduce）而非回答正文，
+        # 导致 review 输出空响应。全部关掉后模型不再看到任何工具定义。
         argv = [
             self.cli_path, "--mode", "print", "--no-tools",
+            "--no-extensions", "--no-skills", "--no-context-files",
+            "--no-prompt-templates", "--no-themes",
             "--system-prompt", system,
             "-p",
             user + "\n\nIMPORTANT: Output ONLY valid JSON. No prose, no markdown "
@@ -134,24 +140,6 @@ class PiAdapter:
         text = strip_fences(text_clean)
         tok = extract_tokens_from_text(text, f"{system}\n{user}")
         return text, tok
-
-    async def review(self, issue, pr_diff, repo_context=None):
-        system = "You are an expert code reviewer. Output JSON only."
-        user = (
-            f"Issue:\n{issue}\n\nPR Diff:\n```diff\n{pr_diff}\n```\n\n"
-            f"Context:\n{json.dumps(repo_context or {}, ensure_ascii=False)}\n\n"
-            "Return JSON: {decision, confidence, summary, defects[]}."
-        )
-        return await self.chat(system=system, user=user)
-
-    async def revise(self, issue, original_pr_diff, review_feedback):
-        system = "You are a code revision expert. Output JSON only."
-        user = (
-            f"Issue:\n{issue}\n\nOriginal Diff:\n```diff\n{original_pr_diff}\n```\n\n"
-            f"Feedback:\n{json.dumps(review_feedback, ensure_ascii=False, indent=2)}\n\n"
-            "Return JSON: {title, body, diff, changes_summary, addressed_defect_indices[]}."
-        )
-        return await self.chat(system=system, user=user)
 
     def get_status(self) -> Dict[str, Any]:
         return {

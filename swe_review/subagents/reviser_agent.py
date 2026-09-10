@@ -14,6 +14,8 @@ import json
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, asdict
 
+from .engineering_prompt import strip_fences
+
 
 REVISION_FEEDBACK_LEVELS = ("full_feedback", "minimal_feedback", "baseline")
 
@@ -249,7 +251,7 @@ class ReviserSubAgent:
         return "{}", {}
 
     def _parse_response(self, response, original_title, original_body, feedback_level):
-        cleaned = _strip_fences(response)
+        cleaned = strip_fences(response)
         try:
             data = json.loads(cleaned)
             diff = data.get("diff", "") or ""
@@ -288,14 +290,3 @@ class ReviserSubAgent:
             "feedback_level": self.feedback_level,
             "capabilities": self.capabilities,
         }
-
-
-def _strip_fences(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```json"):
-        s = s[7:]
-    elif s.startswith("```"):
-        s = s[3:]
-    if s.endswith("```"):
-        s = s[:-3]
-    return s.strip()

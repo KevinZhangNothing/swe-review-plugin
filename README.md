@@ -173,7 +173,7 @@ flowchart TB
 关键设计（源自 SWE-Gate 实证与 swarm 编排原则）：
 
 - **并行 wave + 共享探索**：Wave 1 的多个候选并行生成/评审，且所有候选复用**同一次** explorer 结果（此前每个候选各跑一次 explorer，纯冗余）。
-- **视角多样化**：同一 prompt 采样 N 次会产生高度相关的候选；改为每个候选注入不同 `perspective`（minimal / alternative / constraint_aware，后者主动满足错误语义、作用域泛化、生命周期清理、编码转义四类高危评审约束）。
+- **视角多样化**：同一 prompt 采样 N 次会产生高度相关的候选；改为每个候选注入不同 `perspective`（minimal / alternative / constraint_aware）。minimal 走 simplicity ladder（需要存在吗 → 仓库已有 → 标准库 → 一行？都不成立才新增代码）；constraint_aware 主动满足错误语义、作用域泛化、生命周期清理、编码转义四类高危评审约束。
 - **批次间失败记忆**：Wave 2+ 的生成会收到此前所有被拒候选的紧凑摘要（rationale + decision + top findings，不含 diff），避免重复已失败路径。
 - **Evidence-first 裁决**：approved 候选必须 verify 通过才算 success——review 的语言描述不再能单独决定结果；全部 approved 候选 verify 失败时，对 rejected 候选按 confidence 取 top-2 跑 verify 做证据排序，但 verify-pass **不推翻** review 的拒绝结论（功能测试通过 ≠ 可接受）。
 
@@ -395,13 +395,14 @@ swe-review install-skills
 
 ### 完整测试周期
 
-`install.sh` 提供 5 个子命令。默认是 `install`：
+`install.sh` 提供 6 个子命令。默认是 `install`：
 
 | 子命令 | 说明 |
 |-------|------|
-| `./install.sh install` | 安装 swe-review 包 + 复制 SKILL.md 到 `~/.claude/skills/` 和 `~/.pi/agent/skills/` |
-| `./install.sh uninstall` | 卸载 swe-review 包 + 清除所有已安装的 SKILL.md + 删除 `.env.local` |
+| `./install.sh install` | 安装 swe-review 包 + 为仓库 `.claude/skills/`（唯一源）创建符号链接到 `~/.agents/skills/`、`~/.claude/skills/`、`~/.pi/agent/skills/` |
+| `./install.sh uninstall` | 卸载 swe-review 包 + 清除 SKILL.md 符号链接（不动仓库）+ 删除 `.env.local` |
 | `./install.sh verify` | 运行单元测试（pytest）+ `swe-review list-tools` |
+| `./install.sh e2e` | `install` → `verify` → `uninstall` 全闭环幂等测试 |
 | `./install.sh test-all` | `install` → 4 个 CLI smoke → `uninstall` 闭环 |
 | `./install.sh test-tool pi` | `install` → 单个 CLI 跑一次 `review` → `uninstall` 闭环 |
 
@@ -494,7 +495,7 @@ flowchart LR
 
 | style | 定位 |
 |---|---|
-| `engineering`（默认） | **高级代码审查**：审查对象是 Change 而非 Bug。8 维度 100 分制评分（Design 20 / Maintainability 15 / Consistency 15 / Simplicity 10 / Readability 10 / Testability 10 / Risk 10 / Change Scope 10）+ P0–P4 证据绑定 findings + Hard Gate + 4 档决策（APPROVE / APPROVE_WITH_SUGGESTIONS / REQUEST_CHANGES / BLOCK）。先理解再评价，Project Convention > Generic Best Practice，禁止低价值评论。含 **Review-Constraint Deep Check**（SWE-Gate 启发）：对错误语义、Schema/元数据/类型、作用域泛化、生命周期清理、编码/转义五类高频评审约束定向核查，命中的 finding 标注 `constraint_category`（10 类 canonical 词表，prompt 与 parser 共享同一常量）。输出契约要求 **findings 先于 scores** 且各字段长度克制——输出被截断时丢失尾部的 scores 而不是 findings。 |
+| `engineering`（默认） | **高级代码审查**：审查对象是 Change 而非 Bug。8 维度 100 分制评分（Design 20 / Maintainability 15 / Consistency 15 / Simplicity 10 / Readability 10 / Testability 10 / Risk 10 / Change Scope 10）+ P0–P4 证据绑定 findings + Hard Gate + 4 档决策（APPROVE / APPROVE_WITH_SUGGESTIONS / REQUEST_CHANGES / BLOCK）。先理解再评价，Project Convention > Generic Best Practice，禁止低价值评论。含 **Review-Constraint Deep Check**（SWE-Gate 启发）：对错误语义、Schema/元数据/类型、作用域泛化、生命周期清理、编码/转义五类高频评审约束定向核查，外加 **Simplicity Ladder**（ponytail 启发）——对 diff 中每个新增抽象/helper/依赖逐级核查（是否真实需要 → 仓库已有等价实现 → 标准库已提供 → 平台原生 → 已装依赖 → 能否一行 → 最少代码），违规的 recommendation 必须指明具体替代物。命中的 finding 标注 `constraint_category`（11 类 canonical 词表，prompt 与 parser 共享同一常量）。输出契约要求 **findings 先于 scores** 且各字段长度克制——输出被截断时丢失尾部的 scores 而不是 findings。 |
 | `concise` | legacy bug-fix-centric：判断 patch 是否修复 issue 根因。 |
 | `detailed` | legacy bug-fix-centric：Step 1→6 workflow + symptom-fix detection。 |
 
@@ -605,7 +606,7 @@ flowchart LR
 
 ### 7.1 Claude Code / OpenCode
 
-`./install.sh` 把每个 Skill 复制到 `~/.claude/skills/swe-review-*/`（软链接到 `~/.agents/skills/`）。OpenCode 默认加载该目录：
+`./install.sh` 为仓库 `.claude/skills/`（唯一源）创建符号链接到 `~/.claude/skills/swe-review-*/` 等三处发现路径。OpenCode 默认加载该目录：
 
 ```
 /skill swe-review-review  --issue "..." --pr-diff ./patch.diff

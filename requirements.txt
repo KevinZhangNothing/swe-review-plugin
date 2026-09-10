@@ -1,35 +1,5 @@
-# SWE-Review Plugin Python 依赖
-
-# AI 工具 SDK
-anthropic>=0.40.0
-openai>=1.50.0
-
-# HTTP 客户端
-aiohttp>=3.9.0
-requests>=2.31.0
-
-# 配置和序列化
-pyyaml>=6.0.1
-pydantic>=2.5.0
-
-# Git 操作
-gitpython>=3.1.40
-
-# 工具
-unidiff>=0.7.5
-tree-sitter>=0.21.0
-
-# 日志和输出
-rich>=13.7.0
-loguru>=0.7.2
-tqdm>=4.66.0
+# 运行时零第三方依赖（adapters 通过 CLI 子进程工作，不用 SDK）
 
 # 测试
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
-pytest-cov>=4.1.0
-
-# 类型检查
-mypy>=1.7.0
-types-requests>=2.31.0
-types-pyyaml>=6.0.1

@@ -20,9 +20,10 @@
 
 ## 安装
 
-`./install.sh` 把每个 SKILL.md 复制到：
-- `~/.claude/skills/swe-review-*/SKILL.md`（Claude Code + OpenCode 自动加载）
-- `~/.pi/agent/skills/swe-review/swe-review-*/SKILL.md`（Pi 自动加载）
+`./install.sh` 为仓库 `.claude/skills/`（唯一源）创建符号链接到三处发现路径（幂等，可重复执行）：
+- `~/.agents/skills/swe-review-*`
+- `~/.claude/skills/swe-review-*`（Claude Code + OpenCode 自动加载）
+- `~/.pi/agent/skills/swe-review/swe-review-*`（Pi 自动加载）
 
 ## 调用
 
