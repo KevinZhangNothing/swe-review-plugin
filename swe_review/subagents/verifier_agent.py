@@ -13,11 +13,13 @@ NOTE:
 """
 
 import json
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Dict, Any, List, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 
@@ -31,6 +33,7 @@ class VerificationResult:
     patch_applied: bool
     sandbox_used: bool
     oracle_similarity: Optional[float] = None
+    build_results: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -48,9 +51,12 @@ class VerifierSubAgent:
         self.config = config or {}
         self.name = "verifier"
         self.test_timeout = int(self.config.get("test_timeout", 120))
+        self.build_timeout = int(self.config.get("build_timeout", 600))
+        self.build_check = bool(self.config.get("build_check", True))
         self.sandbox = bool(self.config.get("sandbox", True))  # 默认沙箱运行
         self.capabilities = [
             "run_tests",
+            "build_check",
             "compare_patches",
             "verify_resolution",
             "sandbox_apply",
@@ -105,13 +111,33 @@ class VerifierSubAgent:
                     sandbox_used=sandbox_used,
                 )
 
+            build_results: List[Dict[str, Any]] = []
+            if self.build_check:
+                checks = self._detect_build_checks(self._changed_files(pr_diff), work_repo)
+                build_results = await self._run_build_checks(checks, work_repo)
+                failed = next(
+                    (r for r in build_results if not r["passed"] and not r.get("skipped")),
+                    None,
+                )
+                if failed:
+                    return VerificationResult(
+                        passed=False,
+                        test_results=[],
+                        resolution_status="not_resolved",
+                        confidence=0.9,
+                        details=self._format_details([], build_results),
+                        patch_applied=True,
+                        sandbox_used=sandbox_used,
+                        build_results=build_results,
+                    )
+
             test_results: List[Dict[str, Any]] = []
             if test_info or runner:
                 test_results = await self._run_tests(test_info, runner, work_repo)
 
             status = self._classify_status(test_results)
             confidence = self._calc_confidence(test_results, status)
-            details = self._format_details(test_results)
+            details = self._format_details(test_results, build_results)
 
             oracle_sim: Optional[float] = None
             if oracle:
@@ -126,6 +152,7 @@ class VerifierSubAgent:
                 patch_applied=True,
                 sandbox_used=sandbox_used,
                 oracle_similarity=oracle_sim,
+                build_results=build_results,
             )
         finally:
             self._cleanup_sandbox(tmp)
@@ -159,6 +186,101 @@ class VerifierSubAgent:
             return r2.returncode == 0
         except Exception:
             return False
+
+    # ---- build check: 在 apply patch 之后、跑测试之前，先做编译/依赖检查 ----
+
+    @staticmethod
+    def _changed_files(pr_diff: str) -> List[str]:
+        files: List[str] = []
+        for line in pr_diff.splitlines():
+            if line.startswith("+++ b/"):
+                p = line[len("+++ b/"):].strip()
+                if p and p != "/dev/null" and p not in files:
+                    files.append(p)
+        return files
+
+    def _detect_build_checks(self, changed: List[str], cwd: Path) -> List[Dict[str, Any]]:
+        """显式 resolve_cmd/compile_cmd 优先；否则按改动文件类型自动检测。
+        iOS xcodeproj 工程无法可靠推断 workspace/scheme，须显式给 compile_cmd。"""
+        checks: List[Dict[str, Any]] = []
+        for key, name in (("resolve_cmd", "resolve"), ("compile_cmd", "compile")):
+            raw = self.config.get(key)
+            if raw:
+                cmd = shlex.split(raw) if isinstance(raw, str) else list(raw)
+                checks.append({"name": name, "cmd": cmd})
+        if checks:
+            return checks
+
+        py = [f for f in changed if f.endswith(".py")]
+        if py:
+            # 内存 compile，不写 __pycache__，不污染工作区；sys.executable 保证存在
+            checks.append({
+                "name": "python_syntax",
+                "cmd": [sys.executable, "-c",
+                        "import sys,pathlib\nfor f in sys.argv[1:]:\n"
+                        " compile(pathlib.Path(f).read_text(),f,'exec')"] + py,
+            })
+
+        basenames = {Path(f).name for f in changed}
+        if {"Podfile", "Podfile.lock"} & basenames and shutil.which("pod"):
+            # --deployment: 只校验 Podfile 与 lock 一致性，不拉 repo，秒级
+            checks.append({"name": "pod_resolve", "cmd": ["pod", "install", "--deployment"]})
+        if {"Package.swift", "Package.resolved"} & basenames and shutil.which("swift"):
+            checks.append({"name": "spm_resolve", "cmd": ["swift", "package", "resolve"]})
+        elif (any(f.endswith(".swift") for f in changed)
+              and (cwd / "Package.swift").exists() and shutil.which("swift")):
+            checks.append({"name": "spm_build", "cmd": ["swift", "build"]})
+
+        if (any(f.endswith((".kt", ".java")) for f in changed)
+                and (cwd / "gradlew").exists()):
+            checks.append({
+                "name": "gradle_compile",
+                "cmd": ["./gradlew", "--console=plain", "-q", "compileDebugKotlin"],
+                # 任务不存在时按顺序回退（纯 Java / 非 Android 工程）
+                "fallbacks": ["compileDebugJavaWithJavac", "classes"],
+            })
+
+        if (any(f.endswith(".dart") for f in changed)
+                and (cwd / "pubspec.yaml").exists()):
+            tool = shutil.which("flutter") or shutil.which("dart")
+            if tool:
+                checks.append({"name": "pub_get", "cmd": [tool, "pub", "get"]})
+                checks.append({"name": "dart_analyze", "cmd": [tool, "analyze"]})
+        return checks
+
+    async def _run_build_checks(
+        self, checks: List[Dict[str, Any]], cwd: Path
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for chk in checks:
+            base, task = chk["cmd"][:-1], chk["cmd"][-1]
+            proc: Optional[Dict[str, Any]] = None
+            used = task
+            for t in [task] + chk.get("fallbacks", []):
+                used = t
+                try:
+                    proc = await _run(base + [t], cwd=str(cwd), timeout=self.build_timeout)
+                except FileNotFoundError:
+                    proc = None
+                    break
+                output = proc["stdout"] + proc["stderr"]
+                if proc["returncode"] != 0 and "not found" in output.lower():
+                    continue  # gradle 任务在本工程不存在，尝试回退任务
+                break
+            if proc is None:
+                results.append({"name": chk["name"], "cmd": " ".join(chk["cmd"]),
+                                "passed": True, "skipped": True,
+                                "stdout_tail": "",
+                                "stderr_tail": f"tool not found: {chk['cmd'][0]}"})
+                continue
+            passed = proc["returncode"] == 0
+            results.append({"name": chk["name"], "cmd": " ".join(base + [used]),
+                            "passed": passed,
+                            "stdout_tail": proc["stdout"][-400:],
+                            "stderr_tail": proc["stderr"][-400:]})
+            if not passed:
+                break  # fail fast：依赖/编译挂了就不再往下跑
+        return results
 
     async def _run_tests(
         self,
@@ -238,10 +360,18 @@ class VerifierSubAgent:
             return max(0.0, base - 0.1)
         return base
 
-    def _format_details(self, test_results: List[Dict[str, Any]]) -> str:
-        if not test_results:
-            return "No tests executed (only syntax & diff sanity checked)."
+    def _format_details(
+        self,
+        test_results: List[Dict[str, Any]],
+        build_results: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         out = []
+        for r in build_results or []:
+            mark = "⏭️" if r.get("skipped") else ("✅" if r["passed"] else "❌")
+            out.append(f"{mark} [build:{r['name']}]")
+        if not test_results:
+            out.append("No tests executed (only syntax & diff sanity checked).")
+            return "\n".join(out)
         for r in test_results:
             mark = "✅" if r["passed"] else "❌"
             out.append(f"{mark} [{r['type']}] {r['test']}")

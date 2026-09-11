@@ -18,6 +18,7 @@ Do **not** use inside the review/revise prompt — the verifier CAN see oracle (
 1. Sandbox by default: clones the repo into a `tempfile.mkdtemp` and applies the patch there. User's working tree is untouched.
 2. Optional `oracle` (gold patch) is only used for offline similarity scoring, never injected to a review prompt.
 3. Test runner template uses `{test}` placeholder; default tries `pytest -q`, `pytest -x -q`, `unittest`, `npm test`.
+4. **Build check runs after patch-apply, before tests** (fail fast, `resolution_status=not_resolved`). Auto-detected from changed files: python (in-memory syntax compile), gradle (`compileDebugKotlin` with task fallbacks), flutter/dart (`pub get` + `analyze`), SPM (`swift package resolve` / `swift build`), CocoaPods (`pod install --deployment` — only when Podfile/lock changed). iOS xcodeproj builds can't be auto-detected — pass explicit `resolve_cmd`/`compile_cmd` in config (or `--resolve-cmd`/`--compile-cmd` on the CLI), usually with `sandbox: false` so Pods/DerivedData are reused and the build is incremental. Disable via `build_check: false` / `--no-build-check`; `build_timeout` defaults to 600s.
 
 ## How to invoke
 
@@ -44,4 +45,5 @@ print(res.payload["resolution_status"], res.payload["confidence"])
 - `confidence: float`
 - `details: str`
 - `patch_applied: bool`, `sandbox_used: bool`
+- `build_results: [{name, cmd, passed, skipped?, stdout_tail, stderr_tail}]` — build/dependency checks run before tests; a failed check short-circuits to `not_resolved` (confidence 0.9)
 - `oracle_similarity: float | None`

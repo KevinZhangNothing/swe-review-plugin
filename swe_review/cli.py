@@ -148,7 +148,7 @@ async def _cmd_loop(args) -> None:
     revise = ReviseSkill(tool_adapter=tool, prompt_style=args.prompt_style,
                           feedback_level=args.feedback_level)
     generate = GenerateSkill(tool_adapter=tool)
-    verify = VerifySkill(repo_path=args.repo_path)
+    verify = VerifySkill(repo_path=args.repo_path, config=_build_check_config(args))
     loop = LoopSkill(
         review_skill=review, revise_skill=revise,
         generator_skill=generate, verify_skill=verify,
@@ -176,9 +176,32 @@ async def _cmd_loop(args) -> None:
     _emit(res.payload)
 
 
+def _build_check_config(args) -> dict:
+    cfg = {
+        "sandbox": getattr(args, "sandbox", True),
+        "build_check": not getattr(args, "no_build_check", False),
+        "build_timeout": getattr(args, "build_timeout", 600),
+        "resolve_cmd": getattr(args, "resolve_cmd", None),
+        "compile_cmd": getattr(args, "compile_cmd", None),
+    }
+    return {k: v for k, v in cfg.items() if v is not None}
+
+
+def _add_build_check_args(p) -> None:
+    p.add_argument("--no-build-check", action="store_true",
+                   help="skip the build/dependency check phase after applying the patch")
+    p.add_argument("--resolve-cmd", default=None,
+                   help="explicit dependency-resolution command (overrides auto-detect), "
+                        "e.g. 'pod install --deployment' or 'xcodebuild -resolvePackageDependencies ...'")
+    p.add_argument("--compile-cmd", default=None,
+                   help="explicit compile command (needed for iOS xcodeproj; auto-detect covers "
+                        "python/gradle/flutter/SPM). Pair with --no-sandbox for incremental builds.")
+    p.add_argument("--build-timeout", type=int, default=600)
+
+
 async def _cmd_verify(args) -> None:
     from . import VerifySkill
-    skill = VerifySkill(repo_path=args.repo_path, config={"sandbox": args.sandbox})
+    skill = VerifySkill(repo_path=args.repo_path, config=_build_check_config(args))
     test_info = None
     if args.test_info:
         test_info = json.loads(_read(args.test_info))
@@ -265,6 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_loop.add_argument("--timeout", type=int, default=600,
                         help="per-call adapter timeout in seconds; engineering "
                              "reviews take ~6-9 min, so 900+ is safer for pi")
+    _add_build_check_args(p_loop)
     p_loop.set_defaults(handler=_cmd_loop)
 
     p_ver = sub.add_parser("verify", help="verify a patch via sandbox + tests")
@@ -274,8 +298,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="path or '-' to JSON {fail_to_pass,pass_to_pass}")
     p_ver.add_argument("--oracle", default=None,
                        help="optional gold patch (evaluation only, never injected to review prompt)")
-    p_ver.add_argument("--sandbox", action="store_true", default=True,
-                       help="apply patch in tempdir (default True; safe)")
+    p_ver.add_argument("--sandbox", dest="sandbox", action="store_true", default=True,
+                       help="apply patch in tempdir (default; safe)")
+    p_ver.add_argument("--no-sandbox", dest="sandbox", action="store_false",
+                       help="apply patch in the real worktree (needed for iOS incremental "
+                            "builds that reuse Pods/DerivedData)")
+    _add_build_check_args(p_ver)
     p_ver.set_defaults(handler=_cmd_verify)
 
     return p
