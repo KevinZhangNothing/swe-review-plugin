@@ -11,6 +11,7 @@ Pi 比 Claude Code 友好：subprocess.run 直接可调，不需要 pty。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -30,8 +31,10 @@ PI_DEFAULT_SKILLS_ROOT = Path("~/.pi/agent/skills").expanduser()
 
 
 def _find_cli() -> str:
+    # CLI_BIN_* is the legacy name install.sh used to write; kept for existing env files.
     return (
         os.environ.get("PI_BIN")
+        or os.environ.get("CLI_BIN_PI")
         or shutil.which("pi")
         or "pi"
     )
@@ -51,7 +54,15 @@ class PiAdapter:
         self.cli_path = cli_path or _find_cli()
         # 设计原则：swe 循环不指定具体模型 —— 模型由宿主 CLI/环境决定，
         # adapter 永远不传 --model，也不读 *_MODEL 环境变量。
-        self.skills_dir = Path(skills_dir).expanduser() if skills_dir else PI_DEFAULT_SKILLS_ROOT
+        # skills_dir 优先级：显式参数 > PI_SKILLS_DIR 环境变量 > Pi 默认路径
+        # （install.sh 的 .env.local 模板一直写着 PI_SKILLS_DIR，此前无人读取）。
+        env_skills_dir = os.environ.get("PI_SKILLS_DIR")
+        if skills_dir:
+            self.skills_dir = Path(skills_dir).expanduser()
+        elif env_skills_dir:
+            self.skills_dir = Path(env_skills_dir).expanduser()
+        else:
+            self.skills_dir = PI_DEFAULT_SKILLS_ROOT
         self.timeout = timeout
         self.auto_install_skills = auto_install_skills
         # 默认 skills source: 工程内 .claude/skills
@@ -130,7 +141,14 @@ class PiAdapter:
         ]
 
         env = {"PI_NO_TUI": "1"}
-        out, err, rc = run_subprocess(argv, timeout=self.timeout, extra_env=env)
+        # to_thread, NOT a direct call: `run_subprocess` is synchronous, so calling
+        # it straight from this coroutine blocks the event loop for the subprocess's
+        # whole lifetime. That silently serialised every `asyncio.gather` in the
+        # project — best_of_n's candidate wave, the shard fan-out and the health
+        # probes all ran one-after-another while looking concurrent. Keep the await.
+        out, err, rc = await asyncio.to_thread(
+            run_subprocess, argv, timeout=self.timeout, extra_env=env,
+        )
         text_clean = strip_ansi(out)
         if rc != 0:
             err_tail = (err or text_clean)[-500:]

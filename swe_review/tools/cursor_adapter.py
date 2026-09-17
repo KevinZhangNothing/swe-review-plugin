@@ -7,6 +7,7 @@ CursorAdapter - 严格按官方 SKILL §1 走 `agent --print --trust` + pty.spaw
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -17,8 +18,10 @@ from .base import MODEL_INHERITED_NOTE
 
 
 def _find_cli() -> str:
+    # CLI_BIN_* is the legacy name install.sh used to write; kept for existing env files.
     return (
         os.environ.get("CURSOR_AGENT_BIN")
+        or os.environ.get("CLI_BIN_CURSOR")
         or shutil.which("agent")
         or "agent"
     )
@@ -52,7 +55,14 @@ class CursorAdapter:
         # 不加 --model（按官方 SKILL §1 "不要默认加 --model"；模型由宿主环境决定）。
         argv = [self.cli_path, "--print", "--trust", full_prompt]
 
-        out, err, rc = run_in_pty(argv, timeout=self.timeout)
+        # to_thread, NOT a direct call: `run_in_pty` is synchronous, so calling it
+        # straight from this coroutine blocks the event loop for the child's whole
+        # lifetime, silently serialising every `asyncio.gather` in the project.
+        # (`run_in_pty` installs no signal handlers and waits on its own pid, so it
+        # is safe to run from a worker thread.)
+        out, err, rc = await asyncio.to_thread(
+            run_in_pty, argv, timeout=self.timeout,
+        )
         text_clean = strip_ansi(out)
         if rc != 0:
             err_tail = (err or text_clean)[-500:]

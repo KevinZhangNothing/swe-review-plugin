@@ -706,13 +706,15 @@ def test_hybrid_forwards_runtime_max_iterations():
     loop = LoopSubAgent()
     captured = {}
 
-    async def fake_bon(issue, repo_path, n, t0, prompt_style=None):
+    async def fake_bon(issue, repo_path, n, t0, prompt_style=None,
+                       test_info=None, test_runner=None):
         return LoopResult(success=False, final_decision="reject",
                           final_pr_diff="d", total_iterations=0,
                           strategy="best_of_n")
 
     async def fake_rg(issue, repo_path, initial_pr, max_iter, t0,
-                      prompt_style=None, feedback_level=None):
+                      prompt_style=None, feedback_level=None,
+                      test_info=None, test_runner=None):
         captured["max_iter"] = max_iter
         return LoopResult(success=True, final_decision="approve",
                           final_pr_diff="d", total_iterations=1,

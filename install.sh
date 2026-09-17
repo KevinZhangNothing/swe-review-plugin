@@ -64,19 +64,24 @@ cmd_install() {
     if [ ! -f ".env.local" ]; then
         log "写入 .env.local 模板"
         cat > .env.local <<'EOF'
-# SWE-Review 环境变量（按需修改）。各 adapter 默认读 PATH 上的 CLI 二进制：
-#   claude-code → claude
-#   cursor      → agent
-#   opencode    → /Users/$USER/.opencode/bin/opencode
-#   pi          → pi
+# SWE-Review 环境变量（按需修改）。用法：`source .env.local` —— 这里的赋值会
+# 直接进入当前 shell，无需再手动 export。本文件不会自动加载。
+# CLI 二进制：各 adapter 默认读 PATH，可用下面的变量覆盖（新名优先）：
+#   claude-code → CLAUDE_CODE_BIN   (旧名 CLI_BIN_CLAUDE_CODE 仍被接受)
+#   cursor      → CURSOR_AGENT_BIN  (旧名 CLI_BIN_CURSOR)
+#   opencode    → OPENCODE_BIN      (旧名 CLI_BIN_OPENCODE)
+#   pi          → PI_BIN            (旧名 CLI_BIN_PI)
 # 不在此文件写 API key —— 各 CLI 工具自带认证（OAuth/keychain/settings.json）。
-CLI_BIN_CLAUDE_CODE=claude
-CLI_BIN_CURSOR=agent
-CLI_BIN_OPENCODE=$HOME/.opencode/bin/opencode
-CLI_BIN_PI=pi
+CLAUDE_CODE_BIN=claude
+CURSOR_AGENT_BIN=agent
+OPENCODE_BIN=$HOME/.opencode/bin/opencode
+PI_BIN=pi
 
 PI_SKILLS_DIR=$HOME/.pi/agent/skills
-SWE_REVIEW_TOOL=pi
+# --tool host 用：写进 host request 的 agent 标签
+SWE_REVIEW_AGENT=current-agent
+# --tool 不读这个文件：每个命令都要显式指定（默认 shell = 无 LLM 占位）。
+# 交互式 agent 建议直接用 --tool host，让当前 agent 自己回答 prompt。
 EOF
         ok ".env.local 已创建"
     fi

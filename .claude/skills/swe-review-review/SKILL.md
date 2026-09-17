@@ -69,6 +69,30 @@ result = await skill.execute(
 print(result.payload)
 ```
 
+## Host mode — answer with the agent running this skill (preferred interactively)
+
+`--tool host` does **not** spawn `claude`/`pi`/`opencode`/`agent`. It writes the exact
+prompt to disk and expects **you** (the agent running this command) to answer it with
+your own model:
+
+```bash
+# 1) run; exits 3 with a JSON envelope naming the prompt that needs an answer
+swe-review review --issue "..." --pr-diff pr.diff --tool host --host-dir .swe-host
+
+# 2) read the prompt, answer it with YOUR OWN model (never spawn another CLI)
+swe-review host pending --host-dir .swe-host --show
+swe-review host answer --key <key> --text-file <your answer file>
+
+# 3) re-run the exact same command; answered prompts replay from cache
+swe-review review --issue "..." --pr-diff pr.diff --tool host --host-dir .swe-host
+```
+
+**What to answer:** the review report JSON documented below (engineering or
+concise schema, matching `--prompt-style`). Your raw model output is accepted
+directly — no envelope needed — or use `{"text": ..., "usage": {...}}` to also
+record token usage. `--text -` reads stdin. Exit code 3 = awaiting host,
+0 = done; anything else is a real failure.
+
 ## Output JSON schema — engineering (default)
 
 ```json

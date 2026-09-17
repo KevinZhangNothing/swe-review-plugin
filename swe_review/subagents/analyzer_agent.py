@@ -42,6 +42,18 @@ _REDUNDANCY_SKIP_RE = re.compile(
 )
 
 
+#: Paths that hold tests rather than shipped code. A new `def test_*` or fixture
+#: is not a change to the product's public surface; counting it both misleads the
+#: reviewer and saturates the API term of `complexity_score` — API_NORMALIZER is
+#: 5, so five added test functions alone push that term to 1.0.
+_TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|spec)/"
+    r"|(^|/)test_[^/]*$"
+    r"|(^|/)[^/]*_test\.[A-Za-z0-9]+$"
+    r"|\.(test|spec)\.[A-Za-z0-9]+$"
+)
+
+
 def detect_repeated_added_blocks(
     pr_diff: str,
     min_line_len: int = 12,
@@ -105,7 +117,16 @@ def detect_repeated_added_blocks(
 class AnalyzerSubAgent:
     """静态分析 SubAgent"""
 
-    PUBLIC_NAME_RE = re.compile(r"^(?!_)([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    #: An added **top-level** public definition. The match is anchored at column 0
+    #: on purpose: the previous pattern was applied to `line.lstrip("+").lstrip()`,
+    #: which erased indentation, so every nested call and every added line that
+    #: merely *started* with `identifier(` — `except (`, `isinstance(`, `super().__init__(`,
+    #: `assert (`, wrapped test continuations — was reported as a public API change
+    #: (20/20 false positives on a real self-review) and saturated the API term of
+    #: `complexity_score`.
+    PUBLIC_NAME_RE = re.compile(
+        r"^(?:async\s+)?(?:def|class)\s+(?!_)([A-Za-z][A-Za-z0-9_]*)"
+    )
     TODO_RE = re.compile(r"#\s*TODO|XXX|FIXME", re.IGNORECASE)
     EXCEP_RE = re.compile(r"\b(except|raise)\b")
 
@@ -141,10 +162,16 @@ class AnalyzerSubAgent:
         public_api_changes: List[str] = []
         suspicious: List[Dict[str, str]] = []
         for h in hunks:
+            # Test definitions are not part of the shipped public surface — see
+            # _TEST_PATH_RE for why they must not feed complexity_score either.
+            in_test_file = bool(_TEST_PATH_RE.search(h["file"] or ""))
             for line in h["lines"]:
-                if line.startswith("+") and self.PUBLIC_NAME_RE.match(line.lstrip("+").lstrip()):
-                    sig = line.lstrip("+").strip()
-                    public_api_changes.append(f"{h['file']}::{sig[:120]}")
+                # NOTE: `line[1:]` (not .lstrip()) — indentation is load-bearing
+                # for PUBLIC_NAME_RE, which only accepts top-level definitions.
+                body = line[1:] if line.startswith("+") else line
+                if (line.startswith("+") and not in_test_file
+                        and self.PUBLIC_NAME_RE.match(body)):
+                    public_api_changes.append(f"{h['file']}::{body.strip()[:120]}")
                 if line.startswith("+") and self.TODO_RE.search(line):
                     suspicious.append({"file": h["file"], "hunk": h["header"], "kind": "todo_in_diff"})
                 if line.startswith("+") and self.EXCEP_RE.search(line):

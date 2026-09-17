@@ -21,9 +21,12 @@ Verifier **可以**接收 oracle，因为它跑在 review 链路外，只做分�
 `VerifierSubAgent` 默认 sandbox：
 - `tempfile.mkdtemp(prefix="swe-review-")`
 - 用 `shutil.copytree(..., ignore=(".git","__pycache__","node_modules"))` 只读复制源码
-- `git apply --check` 先 dry-run，通过才 `git apply -`
-- 跑完测试后 `shutil.rmtree(tmp)`
-- 用户工作区永远不被原地修改
+- 在复制出的工作目录中执行 `git apply --check`，通过才 `git apply -`
+- 仓库路径不是目录、临时目录创建或复制失败时，返回 `passed=False`、`patch_applied=False`、`sandbox_used=False`、`resolution_status="unknown"`，不应用补丁、不运行构建或测试
+- 准备失败、后续失败或正常结束都会进入 `finally`，清理已创建的临时目录
+- 默认模式不会因准备失败回退到原仓库；显式 `sandbox=False` 仍会原地应用补丁
+
+这里的沙箱是工作目录副本，不是操作系统级隔离；构建和测试命令仍以当前用户权限运行。
 
 ## 3. Diff 输出格式
 
@@ -52,3 +55,21 @@ ok = diff.startswith(("diff ", "diff --git")) and "@@" in diff
 `ShellTools` 不调任何 LLM，仅返回固定占位 JSON。它的存在意义是：
 - 在没有 LLM CLI 的环境里也能跑通 e2e 管线
 - CI 单元测试时不需要 mock LLM
+
+## 7. Host mode 的落盘内容（`--tool host`）
+
+`--tool host` 不 spawn 任何 CLI，而是把 **完整的 system + user prompt 明文**写到
+`<host-dir>/requests/<key>.json`，答案再由宿主写进 `<host-dir>/responses/<key>.json`
+（文件布局见 `docs/adapters.md`）。
+
+**这意味着 issue 全文与未脱敏的原始 PR diff 会落在磁盘上。** 边界与要求：
+
+- 默认 `.swe-host/` 已在 `.gitignore` 里——**不要提交、不要放进共享目录或同步盘**；
+  这些文件里就是完整的候选补丁与 issue 描述（可能含内部代码、未公开的修复）。
+- 与 §1 的「Reviewer Privacy」是两件事：**模型看不到** oracle/golden_patch/test_info，
+  但 host 模式**会把 prompt 写到本机磁盘**。若 `--host-dir` 指向共享位置，等于把补丁
+  与 issue 一起共享出去。
+- 多用户机器上建议 `chmod 700 <host-dir>`；无人值守场景用 4 个 CLI adapter（不落盘）。
+- `responses/` 里是宿主模型的原始答案，同样按内部材料对待；跑完可整目录删除。
+
+（这条是本插件自检时由它自己提出的 —— 见 `docs/` 与 README 的不变式矩阵。）

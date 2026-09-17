@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# packaging output (`pip wheel .` / `python -m build` write a full copy of the
+# package under build/lib/, which otherwise shows up as untracked source)
+build/
+dist/
+# --tool host rendezvous dir (pending prompts / recorded answers)
+.swe-host/
+# machine-local env config (docs/security.md §4: must never enter the repo)
+.env.local
+# tool/editor local state
+.serena/
+# agent workspace artifacts (review reports / memory notes)
+.workbuddy/

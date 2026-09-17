@@ -27,6 +27,13 @@
 
 ## 调用
 
+### Host mode（推荐：用当前 agent 自己回答，不 spawn 任何 CLI）
+```
+swe-review review --issue "..." --pr-diff p.diff --tool host --host-dir .swe-host
+# 退出码 3 → swe-review host pending --show → host answer --key <k> --text-file ans.json
+# 原样重跑同一命令，已答 prompt 从缓存重放
+```
+
 ### Claude Code / OpenCode（共享 ~/.claude/skills）
 ```
 /skill swe-review-review   <prompt>

@@ -29,14 +29,22 @@ Prompt styles:
 import json
 import asyncio
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from datetime import datetime
 
 from . import engineering_prompt
 from .analyzer_agent import detect_repeated_added_blocks
+from .diff_sharding import (
+    DEFAULT_SHARD_BUDGET_CHARS,
+    DEFAULT_SHARD_CONCURRENCY,
+    DiffShard,
+    plan_shards,
+    should_shard,
+)
 from .engineering_prompt import parse_diff_files, strip_fences, truncate_json_text
+from ..tools.host_adapter import HostTurnRequired
 
 
 # Defect severity & category enumerations
@@ -146,6 +154,57 @@ class Finding:
         )
 
 
+# Strictness ordering used when shard verdicts must be reconciled deterministically.
+DECISION_STRICTNESS = {d: i for i, d in enumerate(DECISION_CHOICES)}
+
+
+def _finding_location_parts(location: Any) -> Tuple[str, Optional[int], Optional[int]]:
+    """`(path, start_line, end_line)` from either location shape."""
+    if isinstance(location, dict):
+        s, e = location.get("start_line"), location.get("end_line")
+        return (str(location.get("path") or ""),
+                s if isinstance(s, int) else None,
+                e if isinstance(e, int) else None)
+    if isinstance(location, str):
+        m = re.match(r"^(.+?):(\d+)(?:-(\d+))?$", location.strip())
+        if m:
+            start = int(m.group(2))
+            return (m.group(1), start, int(m.group(3)) if m.group(3) else start)
+        return (location.strip(), None, None)
+    return ("", None, None)
+
+
+def merge_findings(groups: List[List["Finding"]]) -> List["Finding"]:
+    """Deterministically union the findings reported by shard reviews.
+
+    Deterministic on purpose: the shards are the only place the evidence exists,
+    so a model must never be the thing that decides whether a finding survives.
+    Deduped on (path, line range, severity, normalised title) so two shards
+    reporting the same cross-cutting issue collapse into one, then ordered by
+    severity and location for a stable, diffable report.
+    """
+    order = {sev: i for i, sev in enumerate(FINDING_SEVERITIES)}
+    seen = set()
+    merged: List[Finding] = []
+    for group in groups or []:
+        for f in group or []:
+            path, start, end = _finding_location_parts(getattr(f, "location", ""))
+            key = (path, start, end, getattr(f, "severity", ""),
+                   re.sub(r"\s+", " ", (getattr(f, "title", "") or "").strip().lower())[:70])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(f)
+
+    def sort_key(f: Finding):
+        path, start, _ = _finding_location_parts(getattr(f, "location", ""))
+        return (order.get(getattr(f, "severity", ""), len(FINDING_SEVERITIES)),
+                path, start or 0)
+
+    merged.sort(key=sort_key)
+    return merged
+
+
 @dataclass
 class ReviewReport:
     """审查报告数据结构"""
@@ -248,14 +307,21 @@ def _normalize_location_flat(loc: Any) -> str:
 
 
 def _normalize_location_deep(loc: Any) -> Dict[str, Any]:
-    """Always return {path, start_line, end_line, function?} for nested-schema consumers."""
+    """Always return {path, start_line, end_line, function?, ...grounding} for nested-schema consumers."""
     if isinstance(loc, dict):
-        return {
+        out = {
             "path": loc.get("path", ""),
             "start_line": loc.get("start_line"),
             "end_line": loc.get("end_line"),
             "function": loc.get("function"),
         }
+        # Preserve deterministic grounding annotations (verified /
+        # relocated_from / line_verified / file_lines) added by
+        # location_grounding.ground_report_locations.
+        for k in ("verified", "relocated_from", "line_verified", "file_lines"):
+            if k in loc:
+                out[k] = loc[k]
+        return out
     if isinstance(loc, str):
         # Parse "path:line" or "path:line-line"
         m = re.match(r"^([^:]+):(\d+)(?:-(\d+))?$", loc)
@@ -495,6 +561,9 @@ class ReviewerSubAgent:
         explore_timeout: int = 180,
         max_regen_attempts: int = 3,
         regen_backoff_seconds: float = 2.0,
+        shard_large_diffs: bool = True,
+        shard_budget_chars: int = DEFAULT_SHARD_BUDGET_CHARS,
+        shard_concurrency: int = DEFAULT_SHARD_CONCURRENCY,
     ):
         if prompt_style not in PROMPT_STYLE_CHOICES:
             raise ValueError(
@@ -510,6 +579,12 @@ class ReviewerSubAgent:
         # Each fresh attempt still gets the one-shot JSON repair round.
         self.max_regen_attempts = max(1, int(max_regen_attempts))
         self.regen_backoff_seconds = max(0.0, float(regen_backoff_seconds))
+        # Large-change fan-out. `pr_diff` was the one prompt input with no budget
+        # at all (repo_context 60k, exploration 40k, reviser diff 50k), so a big
+        # change both blew the context and serialised into one slow request.
+        self.shard_large_diffs = bool(shard_large_diffs)
+        self.shard_budget_chars = max(1_000, int(shard_budget_chars))
+        self.shard_concurrency = max(1, int(shard_concurrency))
         self.name = "reviewer"
         self.capabilities = [
             "analyze_diff",
@@ -610,15 +685,55 @@ class ReviewerSubAgent:
                 analysis=analysis,
             )
 
-        # 4) AI call — engineering reports (8 scored dimensions + findings) need
-        # more completion budget than the legacy bug-centric styles.
-        max_tokens = 8192 if prompt_style == "engineering" else 4096
+        # 4) AI call. A change that does not fit one shard's budget is reviewed as
+        # concurrent file-aligned shards; anything smaller keeps the single-call
+        # path byte-for-byte (zero regression for normal-sized changes).
+        #
+        # engineering-only on purpose: the shard prompt is built from the
+        # engineering template, and quietly imposing it on the legacy
+        # concise/detailed styles would change their semantics without saying so.
+        if (self.shard_large_diffs
+                and prompt_style == "engineering"
+                and should_shard(pr_diff, self.shard_budget_chars)):
+            report = await self._review_sharded(
+                issue=issue,
+                pr_title=pr_title,
+                pr_body=pr_body,
+                pr_diff=pr_diff,
+                repo_context=repo_context,
+                analysis=analysis,
+            )
+        else:
+            # engineering reports (8 scored dimensions + findings) need more
+            # completion budget than the legacy bug-centric styles.
+            max_tokens = 8192 if prompt_style == "engineering" else 4096
+            report, _usage, response = await self._review_once(
+                system_prompt, user_prompt, max_tokens, prompt_style
+            )
+            report.raw_response = response
 
-        # Empty/unparseable long-form answers flake intermittently on hosted
-        # gateways (self-loop observation): retry FRESH full calls up to
-        # max_regen_attempts; every attempt still gets the one-shot JSON
-        # repair round below. A wasted empty answer costs the full prompt
-        # anyway, so retrying is cheaper than letting the loop die.
+        report.exploration_steps = exploration_steps
+        return report
+
+    async def _review_once(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        prompt_style: str,
+    ) -> Tuple[ReviewReport, Dict[str, int], str]:
+        """One review request: call → parse, with bounded regen + one JSON repair.
+
+        Extracted so the sharded path reuses the *exact* recovery behaviour rather
+        than duplicating it — the flaky-network handling is the last thing that
+        should exist in two versions.
+
+        Empty/unparseable long-form answers flake intermittently on hosted
+        gateways (self-loop observation): retry FRESH full calls up to
+        max_regen_attempts; every attempt still gets the one-shot JSON repair
+        round. A wasted empty answer costs the full prompt anyway, so retrying is
+        cheaper than letting the loop die.
+        """
         report: Optional[ReviewReport] = None
         response = ""
         token_usage: Dict[str, int] = {}
@@ -662,9 +777,234 @@ class ReviewerSubAgent:
                 await asyncio.sleep(self.regen_backoff_seconds * attempt)
 
         assert report is not None
-        report.raw_response = response
-        report.exploration_steps = exploration_steps
-        return report
+        return report, token_usage, response
+
+    async def _review_sharded(
+        self,
+        *,
+        issue: str,
+        pr_title: str,
+        pr_body: str,
+        pr_diff: str,
+        repo_context: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> ReviewReport:
+        """Map-reduce review of a large change (engineering style only).
+
+        MAP  — one concurrent review per file-aligned shard, each with a bounded
+               prompt and an explicit scope header (see `_shard_scope_section`).
+        REDUCE — findings are merged by **deterministic code** (union, deduped,
+               severity-ordered) so no shard's evidence can be dropped by a model,
+               then ONE synthesis call assigns the global scores / decision /
+               summary. If that call fails, a deterministic worst-case aggregation
+               keeps the review usable instead of losing it.
+        """
+        shards = plan_shards(pr_diff, self.shard_budget_chars)
+        system_prompt = engineering_prompt.system_prompt(
+            languages=engineering_prompt.detect_languages(pr_diff)
+        )
+        max_tokens = 8192
+
+        if len(shards) <= 1:
+            # Budget arithmetic said shard, the splitter disagrees (e.g. one
+            # oversized file): review it as-is rather than reporting nothing.
+            user_prompt = engineering_prompt.user_prompt(
+                issue=issue, pr_title=pr_title, pr_body=pr_body, pr_diff=pr_diff,
+                repo_context=repo_context, analysis=analysis,
+            )
+            report, _u, response = await self._review_once(
+                system_prompt, user_prompt, max_tokens, "engineering"
+            )
+            report.raw_response = response
+            return report
+
+        semaphore = asyncio.Semaphore(max(1, self.shard_concurrency))
+        token_usage: Dict[str, int] = {}
+
+        async def review_shard(shard: DiffShard) -> Tuple[DiffShard, ReviewReport, str]:
+            async with semaphore:
+                prompt = engineering_prompt.user_prompt(
+                    issue=issue, pr_title=pr_title, pr_body=pr_body,
+                    pr_diff=shard.diff,
+                    repo_context=_context_for_shard(repo_context, shard),
+                    analysis=analysis, shard=shard.to_dict(),
+                )
+                rep, _usage, raw = await self._review_once(
+                    system_prompt, prompt, max_tokens, "engineering"
+                )
+                return shard, rep, raw
+
+        # One shard raising must not sink the whole review — same reasoning as
+        # best_of_n's `return_exceptions=True`.
+        outcomes = await asyncio.gather(
+            *[review_shard(s) for s in shards], return_exceptions=True
+        )
+
+        reports: List[ReviewReport] = []
+        failed: List[str] = []
+        for shard, outcome in zip(shards, outcomes):
+            if isinstance(outcome, BaseException):
+                failed.append(f"shard {shard.index}: {type(outcome).__name__}: {outcome}")
+                continue
+            _shard, rep, _raw = outcome
+            token_usage = _merge_token_usage(token_usage, rep.token_usage or {})
+            if rep.parse_error:
+                failed.append(f"shard {shard.index}: {rep.parse_error}")
+                continue
+            reports.append(rep)
+
+        if not reports:
+            # No usable shard: report untrusted (withhold-approve holds downstream)
+            # rather than inventing an approve.
+            return ReviewReport(
+                decision="request_changes",
+                confidence=0.0,
+                summary={"overall_assessment":
+                         f"Sharded review produced no usable shard report "
+                         f"({len(shards)} shards attempted)."},
+                scores={},
+                findings=[],
+                defects=[],
+                token_usage=token_usage,
+                prompt_style="engineering",
+                parse_error="sharded_review_all_shards_failed: " + "; ".join(failed[:6]),
+            )
+
+        # Findings come from the deterministic merge, never from a model. A shard
+        # whose own report is untrusted (truncated repair) still contributes its
+        # findings, but the merged report stays untrusted so the loop's
+        # withhold-approve gate keeps holding.
+        merged_findings = merge_findings([r.findings for r in reports])
+        untrusted = [r for r in reports if r.truncated_repair]
+
+        synthesis, synth_usage = await self._synthesize_shards(
+            issue=issue, pr_title=pr_title, pr_body=pr_body,
+            findings=merged_findings, shards=shards, analysis=analysis,
+            system_prompt=f"{system_prompt}\n\n{_SYNTHESIS_SYSTEM}",
+            max_tokens=max_tokens,
+        )
+        token_usage = _merge_token_usage(token_usage, synth_usage)
+
+        base = synthesis or self._worst_case_report(reports)
+        base.findings = merged_findings
+        base.defects = [f.to_defect() for f in merged_findings]
+        base.token_usage = token_usage
+        base.prompt_style = "engineering"
+        base.exploration_steps = 0
+        # Provenance goes in `summary` because that is what reaches the caller —
+        # `raw_response` is not part of `to_dict()`, so writing it there made the
+        # shard plan invisible in every serialized report.
+        base.summary = dict(base.summary or {})
+        base.summary["sharded_review"] = (
+            f"{len(shards)} shards ({sum(1 for s in shards if s.oversized)} oversized), "
+            f"{len(reports)} usable, {len(failed)} failed, "
+            f"{len(merged_findings)} findings merged"
+            + ("" if synthesis else "; synthesis unavailable → deterministic aggregation")
+        )
+        if failed:
+            base.summary["degraded_shards"] = "; ".join(failed[:6])
+        if untrusted:
+            base.truncated_repair = True
+        base.raw_response = base.summary["sharded_review"]
+        return base
+
+    async def _synthesize_shards(
+        self,
+        *,
+        issue: str,
+        pr_title: str,
+        pr_body: str,
+        findings: List[Finding],
+        shards: List[DiffShard],
+        analysis: Dict[str, Any],
+        system_prompt: str,
+        max_tokens: int,
+    ) -> Tuple[Optional[ReviewReport], Dict[str, int]]:
+        """Turn per-shard findings into a global verdict in ONE call.
+
+        Returns `(report_or_None, token_usage)`. `None` means "unavailable" and the
+        caller falls back to deterministic aggregation — a synthesis outage must
+        never discard a review that already holds real evidence.
+        """
+        if not self.tool_adapter:
+            return None, {}
+        prompt = _synthesis_user_prompt(issue, pr_title, pr_body, findings, shards,
+                                        analysis)
+        token_usage: Dict[str, int] = {}
+        for attempt in range(1, self.max_regen_attempts + 1):
+            response, usage = await self._call_ai_tool_with_retries(
+                # The engineering system prompt carries the JSON schema and the
+                # dimension definitions. Sending only the task framing produced a
+                # hollow-but-parseable answer (no scores, no summary) that the
+                # sanity gate accepts when the `scores` key is absent entirely.
+                system_prompt, prompt, max_tokens=max_tokens
+            )
+            token_usage = _merge_token_usage(token_usage, usage)
+            report = self._parse_response(response, token_usage,
+                                          prompt_style="engineering")
+            numeric = sum(1 for e in (report.scores or {}).values()
+                          if isinstance(e.get("score"), (int, float)))
+            if not report.parse_error and numeric >= 4:
+                # total_score is the report's contract; derive it when the model
+                # omitted it so a valid-but-partial synthesis stays usable.
+                if report.total_score is None and report.scores:
+                    vals = [e.get("score") for e in report.scores.values()
+                            if isinstance(e.get("score"), (int, float))]
+                    if vals:
+                        report.total_score = float(sum(vals))
+                report.findings = []
+                report.defects = []
+                return report, token_usage
+            if attempt < self.max_regen_attempts:
+                await asyncio.sleep(self.regen_backoff_seconds * attempt)
+        return None, token_usage
+
+    def _worst_case_report(self, reports: List[ReviewReport]) -> ReviewReport:
+        """Deterministic aggregation used when synthesis is unavailable.
+
+        Conservative by construction: the STRICTEST shard decision wins and every
+        dimension takes the WORST score any shard gave — a shard that found a
+        design problem must not be averaged away by shards that did not.
+        """
+        decision = "approve"
+        confidence = 0.0
+        scores: Dict[str, Dict[str, Any]] = {}
+        for rep in reports:
+            if (DECISION_STRICTNESS.get(rep.decision, 0)
+                    > DECISION_STRICTNESS.get(decision, 0)):
+                decision = rep.decision
+            confidence = max(confidence, rep.confidence or 0.0)
+            for dim, entry in (rep.scores or {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                score = entry.get("score")
+                if not isinstance(score, (int, float)):
+                    continue
+                current = scores.get(dim)
+                if current is None or score < current["score"]:
+                    scores[dim] = {"score": score,
+                                   "max": entry.get("max", SCORE_DIMENSIONS.get(dim, 10)),
+                                   "reason": entry.get("reason", "")}
+        for dim, maximum in SCORE_DIMENSIONS.items():
+            scores.setdefault(dim, {"score": None, "max": maximum, "reason": ""})
+        total = [s["score"] for s in scores.values() if isinstance(s["score"], (int, float))]
+        # Shards normally report findings only, so a fallback usually has no
+        # dimension scores to aggregate. Say so explicitly rather than shipping a
+        # silently scoreless report (that is the hollow-report failure mode).
+        detail = ("strictest decision, worst score per dimension" if total else
+                  "strictest decision; dimension scores are unavailable because "
+                  "shards report findings only")
+        return ReviewReport(
+            decision=decision,
+            confidence=confidence,
+            summary={"overall_assessment":
+                     f"Synthesis step unavailable; aggregated {len(reports)} shard "
+                     f"reports deterministically ({detail})."},
+            scores=scores,
+            total_score=float(sum(total)) if total else None,
+            hard_gate={"triggered": False, "reason": ""},
+            prompt_style="engineering",
+        )
 
     # ------------------------------------------------------------------
     async def _explore(self, repo_path, issue, pr_diff, focus_files, max_steps):
@@ -754,8 +1094,10 @@ class ReviewerSubAgent:
             try:
                 return await self._call_ai_tool(system_prompt, user_prompt,
                                                 max_tokens=max_tokens)
-            except FileNotFoundError:
-                # Deterministic (CLI missing) — retrying cannot help.
+            except (FileNotFoundError, HostTurnRequired):
+                # Deterministic (CLI missing / host turn required) — retrying cannot
+                # help: a host turn only succeeds once the host writes its answer, so
+                # burning regenerations would just delay the same exception.
                 raise
             except Exception as exc:  # adapter errors vary by CLI
                 last_exc = exc
@@ -945,6 +1287,100 @@ def _json_repair_user(raw_response: str, parse_error: str) -> str:
         f"{snippet}\n\n"
         "Output ONLY the corrected, valid JSON object."
     )
+
+
+# ---------------------------------------------------------------------------
+# Sharded-review synthesis round
+# ---------------------------------------------------------------------------
+
+_SYNTHESIS_SYSTEM = (
+    "You are the SYNTHESIS step of a sharded code review. A large change was "
+    "split by file and reviewed in parallel; you receive the union of every "
+    "shard's findings plus the shape of the whole change.\n\n"
+    "The findings are FINAL: do not re-litigate, add, or remove any of them — a "
+    "deterministic merge already collected them and they are appended to your "
+    "output by the caller. Your job is the GLOBAL judgement no single shard could "
+    "make: judge consistency ACROSS the files it could not see, then assign the "
+    "8-dimension scores, the 4-level decision, the hard gate, and a summary of the "
+    "change as a whole.\n\n"
+    "You MUST emit every one of the 8 dimension scores with a numeric `score` — a "
+    "response without them is discarded and the review degrades to a worse "
+    "fallback, so an incomplete answer is strictly worse than a cautious one.\n\n"
+    "Output ONLY one JSON object — no prose, no markdown fences."
+)
+
+
+def _synthesis_user_prompt(issue, pr_title, pr_body, findings, shards,
+                           analysis) -> str:
+    payload = []
+    for f in findings:
+        path, start, end = _finding_location_parts(getattr(f, "location", ""))
+        payload.append({
+            "severity": getattr(f, "severity", ""),
+            "title": getattr(f, "title", ""),
+            "location": {"path": path, "start_line": start, "end_line": end},
+            "observation": getattr(f, "observation", ""),
+            "why_it_matters": getattr(f, "why_it_matters", ""),
+            "evidence": getattr(f, "evidence", ""),
+            "recommendation": getattr(f, "recommendation", ""),
+            "constraint_category": getattr(f, "constraint_category", ""),
+        })
+    shape = {
+        "shards": len(shards),
+        "files": [f for s in shards for f in s.files],
+        "largest_shard_chars": max((s.chars for s in shards), default=0),
+        "oversized_shards": [s.index for s in shards if s.oversized],
+        "total_additions": analysis.get("total_additions"),
+        "total_deletions": analysis.get("total_deletions"),
+    }
+    return (
+        "## Change Context / Intent\n"
+        f"{issue}\n\n"
+        "## PR Metadata\n"
+        f"**Title**: {pr_title}\n"
+        f"**Description**: {pr_body or 'N/A'}\n\n"
+        "## Shape of the whole change\n"
+        f"{json.dumps(shape, indent=2, ensure_ascii=False)}\n\n"
+        "## Findings collected from all shards (FINAL — do not add or remove)\n"
+        f"{json.dumps(payload, indent=2, ensure_ascii=False)}\n\n"
+        "## Your Task\n"
+        "1. Judge the change as a whole: design coherence, consistency ACROSS the "
+        "files listed above, maintainability, risk introduced by the change, scope.\n"
+        "2. Score all 8 dimensions ("
+        + ", ".join(f"{k} 0-{v}" for k, v in SCORE_DIMENSIONS.items())
+        + ").\n"
+        "3. Give total_score out of 100.\n"
+        "4. Decide: approve | approve_with_suggestions | request_changes | block.\n"
+        "5. Write summary (overall_assessment etc.), whats_good, "
+        "recommended_actions.\n"
+        "6. hard_gate.triggered = true only if the change must not land.\n\n"
+        "Do NOT emit a `findings` array (it is merged from the shards already). "
+        "Output ONLY the JSON object."
+    )
+
+
+def _context_for_shard(repo_context: Dict[str, Any],
+                       shard: DiffShard) -> Dict[str, Any]:
+    """Narrow the shared repo context to the files this shard actually reviews.
+
+    The context is re-sent in every shard prompt, so leaving the whole
+    `file_contents` map in each one multiplies the prompt overhead by the shard
+    count — measured as ~2x total tokens versus one call. A shard needs the
+    contents of its own files; the global signals (keywords, root hints, call
+    chain, test files) are small and stay so cross-cutting judgement is not lost.
+    """
+    contents = repo_context.get("file_contents") or {}
+    if not contents:
+        return repo_context
+    keep = set(shard.files)
+    narrowed = {k: v for k, v in contents.items() if k in keep}
+    if len(narrowed) == len(contents):
+        return repo_context
+    out = dict(repo_context)
+    out["file_contents"] = narrowed
+    out["note"] = (f"file_contents narrowed to this shard's {len(narrowed)} "
+                   f"file(s) out of {len(contents)} in the change")
+    return out
 
 
 def _merge_token_usage(a: Optional[Dict[str, int]], b: Optional[Dict[str, int]]) -> Dict[str, int]:

@@ -31,6 +31,29 @@ res = await gen.execute(
 open("candidate.diff", "w").write(res.payload["diff"])
 ```
 
+## Host mode — answer with the agent running this skill (preferred interactively)
+
+`--tool host` does **not** spawn `claude`/`pi`/`opencode`/`agent`. It writes the
+generation prompt to disk and expects **you** to answer it with your own model:
+
+```bash
+# 1) run; exits 3 with a JSON envelope naming the prompt that needs an answer
+swe-review loop --issue "..." --strategy review_guided --tool host --host-dir .swe-host
+
+# 2) read the prompt, answer it with YOUR OWN model (never spawn another CLI)
+swe-review host pending --host-dir .swe-host --show
+swe-review host answer --key <key> --text-file <your answer file>
+
+# 3) re-run the exact same command; answered prompts replay from cache and the
+#    loop advances to its next phase (review -> revise/verify ...)
+swe-review loop --issue "..." --strategy review_guided --tool host --host-dir .swe-host
+```
+
+**What to answer:** the candidate-PR JSON below (`title`/`body`/`diff`/`rationale`,
+diff must be `git apply`-compatible). Your raw model output is accepted directly,
+or `{"text": ..., "usage": {...}}` to also record token usage. Exit code 3 =
+awaiting host, 0 = done.
+
 ## Output keys
 
 - `title`, `body`, `diff` (unified diff text), `rationale`, `confidence` (0..1)

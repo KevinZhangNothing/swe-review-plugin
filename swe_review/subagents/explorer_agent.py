@@ -50,6 +50,27 @@ STOPWORDS = {
 }
 
 
+#: Directory names that are never worth surfacing as "related files": vendored
+#: dependencies, build output, VCS metadata and tool-local state. Without this
+#: the keyword grep returned 600+ paths for issue keywords as generic as `review`
+#: or `work` — every one of them inside a vendored `node_modules` tree. That both
+#: starves the genuinely related files and bloats the reviewer's context.
+IGNORED_DIR_NAMES = (
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+    ".eggs", ".pytest_cache", ".ruff_cache", ".mypy_cache", "DerivedData",
+    "Pods", ".opencode", ".serena", ".tokensave", ".swe-host", ".idea", ".vscode",
+    # agent workspace artifacts (review reports / memory notes) — gitignored too
+    ".workbuddy",
+)
+
+#: Hard ceiling on reported related files, kept small so one keyword cannot
+#: flood the reviewer's repo context.
+MAX_RELATED_FILES = 25
+
+#: Roots that conventionally hold tests *separately* from the sources.
+TEST_ROOT_NAMES = ("tests", "test", "spec")
+
+
 class ExplorerSubAgent:
     """探索代码仓库的 SubAgent。"""
 
@@ -108,7 +129,10 @@ class ExplorerSubAgent:
         result.steps += 1
 
         # 5) 读关键文件内容（含截断）
-        priority = result.files_modified + result.related_files[:10]
+        # Test files rank ABOVE the grepped "related" files: knowing whether the
+        # change is covered matters more than reading whichever files happened to
+        # share a keyword.
+        priority = result.files_modified + result.test_files + result.related_files[:10]
         priority = list(dict.fromkeys(priority))[: self.max_files_read]
         if priority:
             result.file_contents, truncated = self._read_key_files(priority)
@@ -144,16 +168,19 @@ class ExplorerSubAgent:
         return out
 
     def _search_related_files(self, keywords: List[str], time_budget: int) -> List[str]:
-        """shell grep 找包含关键词的相关文件"""
+        """shell grep 找包含关键词的相关文件（跳过 vendored / 构建 / 工具状态目录）"""
         related: List[str] = []
         if not keywords or not self.repo_path.exists():
             return related
         # 限制时间预算 + 文件数量
         per_kw = max(2, min(5, time_budget * 2))
+        excludes: List[str] = []
+        for name in IGNORED_DIR_NAMES:
+            excludes += ["--exclude-dir", name]
         for kw in keywords[:per_kw]:
             try:
                 r = subprocess.run(
-                    ["grep", "-r", "-l", "-I",
+                    ["grep", "-r", "-l", "-I", *excludes,
                      "--include=*.py", "--include=*.js", "--include=*.ts",
                      "--include=*.java", "--include=*.go", "--include=*.rs",
                      "--include=*.cpp", "--include=*.c", "--include=*.h",
@@ -167,30 +194,53 @@ class ExplorerSubAgent:
                         rel = str(Path(fp).relative_to(self.repo_path))
                     except ValueError:
                         rel = fp
+                    # Defence in depth: --exclude-dir covers directories, this
+                    # also drops paths that reach an ignored dir some other way.
+                    if any(part in IGNORED_DIR_NAMES for part in Path(rel).parts):
+                        continue
                     if rel not in related:
                         related.append(rel)
+                    # Cap INSIDE the inner loop: checking only between keywords
+                    # let a single high-frequency keyword (e.g. `review`) return
+                    # hundreds of paths before the cap was ever consulted.
+                    if len(related) >= MAX_RELATED_FILES:
+                        return related
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 continue
-            if len(related) >= 25:
-                break
         return related
 
     def _find_test_files(self, source_files: List[str]) -> List[str]:
+        """Discover tests for the changed sources.
+
+        Searches both next to each source (co-located `test_<stem>.py`) and in
+        the repo's conventional test roots. The co-located-only lookup returned
+        an empty list for this very repository — whose tests live in `tests/` —
+        so the reviewer never saw a single test file.
+        """
         tests: List[str] = []
+        roots = [self.repo_path / n for n in TEST_ROOT_NAMES]
+        roots = [r for r in roots if r.is_dir()]
         for src in source_files:
             base = Path(src).stem
-            parent = Path(src).parent
             patterns = [
                 f"test_{base}.py", f"{base}_test.py",
+                f"test_{base}_*.py",  # test_<stem>_<aspect>.py
                 f"{base}.test.js", f"{base}.spec.js",
                 f"{base}_test.go", f"Test{base.title().replace('_','')}.java",
             ]
-            for pat in patterns:
-                tp = self.repo_path / parent / pat
-                if tp.exists() and tp.is_file():
-                    rel = str(tp.relative_to(self.repo_path))
-                    if rel not in tests:
-                        tests.append(rel)
+            for directory in [self.repo_path / Path(src).parent, *roots]:
+                if not directory.is_dir():
+                    continue
+                for pat in patterns:
+                    for tp in sorted(directory.glob(pat)):
+                        if not tp.is_file():
+                            continue
+                        try:
+                            rel = str(tp.relative_to(self.repo_path))
+                        except ValueError:
+                            continue
+                        if rel not in tests:
+                            tests.append(rel)
         return tests
 
     def _read_key_files(self, files: List[str]) -> Tuple[Dict[str, str], bool]:

@@ -13,6 +13,7 @@ ClaudeCodeAdapter - 严格按 Claude Code 官方 SKILL §1 走 `claude -p` + pty
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -26,8 +27,11 @@ from ._pty_runner import (
 
 
 def _find_cli() -> str:
+    # CLI_BIN_* is the legacy name install.sh used to write into .env.local;
+    # accepted so existing files keep working (they were silently ignored before).
     return (
         os.environ.get("CLAUDE_CODE_BIN")
+        or os.environ.get("CLI_BIN_CLAUDE_CODE")
         or shutil.which("claude")
         or "claude"
     )
@@ -66,8 +70,13 @@ class ClaudeCodeAdapter:
         # 不加 --model（遵守官方 SKILL §1："don't default to --model"；模型由宿主环境决定）
         argv.append(full_prompt)
 
-        out, err, rc = run_in_pty(
-            argv, timeout=self.timeout, extra_env=self._claude_env,
+        # to_thread, NOT a direct call: `run_in_pty` is synchronous, so calling it
+        # straight from this coroutine blocks the event loop for the child's whole
+        # lifetime, silently serialising every `asyncio.gather` in the project.
+        # (`run_in_pty` installs no signal handlers and waits on its own pid, so it
+        # is safe to run from a worker thread.)
+        out, err, rc = await asyncio.to_thread(
+            run_in_pty, argv, timeout=self.timeout, extra_env=self._claude_env,
         )
         text_clean = strip_ansi(out)
         if rc != 0:

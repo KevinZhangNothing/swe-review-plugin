@@ -2,15 +2,50 @@
 
 每个 Adapter 把 LLM 调用统一收敛到 `chat(system, user) → (text, token_usage)`。
 
-## 当前实现的 5 个
+## 当前实现的 6 个
 
 | Adapter | CLI binary | Headless 命令 | 备注 |
 |--------|-----------|-------------|-----|
 | `ClaudeCodeAdapter` | `claude` | `claude -p --output-format json ...` | 解析 `--output-format json` 为 token 用量 |
 | `CursorAdapter`     | `agent` | `agent --print --trust ...` | Cursor 终端 agent headless |
 | `OpenCodeAdapter`   | `opencode` | `opencode run ...` | 自动读 `~/.claude/skills/` |
-| `PiAdapter`         | `pi` | `pi --mode print --no-tools -p ... --skill <path>` | 暴露 `--skill` 自动安装；`--no-tools` 保证纯文本生成 |
+| `PiAdapter`         | `pi` | `pi --mode print --no-tools --no-skills … --system-prompt <sys> -p <user>` | 纯文本生成：`--no-tools` 加上关闭全部扩展/技能/上下文注入，避免模型在大 prompt 下输出 `<tool_call>`。SKILL.md 由 `install_skills()` 复制/软链到 `~/.pi/agent/skills/swe-review/`，**不**通过 `--skill` 旗标 |
+| `HostAdapter`       | (无) | — | **不 spawn 任何 CLI**：把 prompt 写到磁盘，由「正在运行的 agent」自己回答（见下） |
 | `ShellTools`        | (无) | — | 占位 JSON，无 LLM 调用，仅离线测试 |
+
+注册表在 `swe_review/tools/__init__.py`（`ADAPTER_NAMES` / `build_adapter`），
+是 CLI `--tool` 的唯一事实来源 —— 加一个 adapter 只需在那里加一行，`review` /
+`revise` / `loop` 三处 `--tool` 自动跟上。
+
+## HostAdapter：用「当前 agent」当 LLM（`--tool host`）
+
+SKILL.md 是给宿主的指令，不是能回调宿主的代码，所以把一次 LLM 回答变成一次
+磁盘往返（记忆化重放）：
+
+```
+<host-dir>/requests/<key>.json    # 待答 prompt（key = sha256(system, user) 前 16 位）
+<host-dir>/responses/<key>.json   # 宿主答案 {"text": ..., "usage": {...}}（或 .txt）
+```
+
+1. `chat()` 未命中 → 写 request 并抛 `HostTurnRequired`；CLI 捕获后输出 JSON 信封并以
+   **退出码 3**（`EXIT_AWAITING_HOST`）结束。
+2. 宿主 agent 读 prompt，用**自己的模型**回答（不 spawn 其他 CLI），
+   `swe-review host answer --key <key> --text-file <file>` 写回。
+3. 原样重跑同一命令：已答 prompt 命中缓存，确定性代码重放到下一个未答 prompt。
+
+因为 loop 最终只调 `adapter.chat()`，`LoopSubAgent` 无需任何改造 —— 三种 strategy、
+早停、hard gate 全部自动兼容。适合交互式 agent 使用；无人值守（CI / 批量评测）仍用
+4 个 CLI adapter（宿主 agent 在场时它们并不存在）。
+
+```bash
+swe-review review --issue "..." --pr-diff p.diff --tool host --host-dir .swe-host
+swe-review host pending --host-dir .swe-host --show
+swe-review host answer --key <key> --text-file answer.json   # 裸答案或 {"text":...}
+swe-review review --issue "..." --pr-diff p.diff --tool host --host-dir .swe-host
+```
+
+CLI 二进制路径可用环境变量覆盖：`CLAUDE_CODE_BIN` / `CURSOR_AGENT_BIN` /
+`OPENCODE_BIN` / `PI_BIN`（旧名 `CLI_BIN_*` 仍被接受）。
 
 ## 调用契约
 

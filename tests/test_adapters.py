@@ -1,7 +1,9 @@
-"""Adapter tests — only test construction & get_status (no LLM calls)."""
+"""Adapter tests — construction, status, and event-loop behaviour (no LLM calls)."""
 
 import os
 from pathlib import Path
+
+import pytest
 
 from swe_review import (
     ClaudeCodeAdapter, CursorAdapter, OpenCodeAdapter, PiAdapter, ShellTools,
@@ -40,7 +42,9 @@ def test_shell_status():
 
 def test_adapters_share_chat_signature():
     """All concrete adapters must implement `chat(system, user)` returning (str, dict)."""
-    for cls in (ClaudeCodeAdapter, CursorAdapter, OpenCodeAdapter, PiAdapter, ShellTools):
+    from swe_review import HostAdapter
+    for cls in (ClaudeCodeAdapter, CursorAdapter, OpenCodeAdapter, PiAdapter,
+                ShellTools, HostAdapter):
         assert hasattr(cls, "chat")
 
 
@@ -124,3 +128,64 @@ def test_adapters_never_pin_a_model(monkeypatch):
     assert "evil-model" not in joined, "PiAdapter leaked a model name"
     # Hard constraint #5: subagent calls are pure text generation.
     assert "--no-tools" in captured["argv"], "PiAdapter must run with --no-tools"
+
+
+# ---------------------------------------------------------------------------
+# Event-loop non-blocking
+#
+# All four CLI adapters call a SYNCHRONOUS helper (`run_subprocess` /
+# `run_in_pty`) from their `async def chat`. Calling it directly blocks the event
+# loop for the child's whole lifetime, which silently serialised every
+# `asyncio.gather` in the project — the best_of_n candidate wave, the large-diff
+# shard fan-out and the health probes all ran strictly one-after-another while
+# looking concurrent. Measured on a real 263 KB diff: 5 shards took 127 s with a
+# per-shard cost that grew linearly with the shard count, the signature of serial
+# execution.
+# ---------------------------------------------------------------------------
+
+ADAPTER_FACTORIES = {
+    "pi": lambda: PiAdapter(auto_install_skills=False, timeout=5),
+    "opencode": lambda: OpenCodeAdapter(timeout=5),
+    "cursor": lambda: CursorAdapter(timeout=5),
+    "claude-code": lambda: ClaudeCodeAdapter(timeout=5),
+}
+
+BLOCKING_SYMBOL = {
+    "pi": "run_subprocess",
+    "opencode": "run_subprocess",
+    "cursor": "run_in_pty",
+    "claude-code": "run_in_pty",
+}
+
+
+def _adapter_module(name: str):
+    import importlib
+    return importlib.import_module(f"swe_review.tools.{name.replace('-', '_')}_adapter")
+
+
+@pytest.mark.parametrize("name", sorted(ADAPTER_FACTORIES))
+def test_cli_adapter_chat_does_not_block_the_event_loop(monkeypatch, name):
+    import asyncio
+    import time
+
+    module = _adapter_module(name)
+    symbol = BLOCKING_SYMBOL[name]
+
+    def slow_blocking(*args, **kwargs):
+        time.sleep(0.3)          # what a real CLI subprocess call does: block
+        return "", "", 0
+
+    monkeypatch.setattr(module, symbol, slow_blocking)
+    adapter = ADAPTER_FACTORIES[name]()
+
+    async def gather_four():
+        started = time.monotonic()
+        await asyncio.gather(*[adapter.chat("system", "user") for _ in range(4)])
+        return time.monotonic() - started
+
+    elapsed = asyncio.run(gather_four())
+    # Serialised would be ~1.2 s; truly concurrent stays near one call.
+    assert elapsed < 0.9, (
+        f"{name}: 4 concurrent chat() calls took {elapsed:.2f}s — the adapter is "
+        f"blocking the event loop instead of awaiting {symbol} in a thread"
+    )

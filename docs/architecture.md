@@ -37,7 +37,7 @@ approve ? merge : next iteration (≤ max_iterations)
   - `ReviserSubAgent.__init__`
   - `GeneratorSubAgent.__init__`
 - Verifier 可以接收 oracle（评测用），但**绝不**进入 review/revise 上下文。
-- Verifier 默认 sandbox（`tempfile.mkdtemp`），用户工作区永远不被原地修改。
+- Verifier 默认 sandbox（`tempfile.mkdtemp`）：无效仓库或沙箱准备失败即返回失败，不回退到原仓库；已创建的临时目录在 `finally` 中清理。显式 `sandbox=False` 仍原地应用补丁。工作目录副本不提供操作系统级隔离。
 
 ## 4. 与四款 CLI 的对接
 
@@ -47,6 +47,7 @@ approve ? merge : next iteration (≤ max_iterations)
 | `CursorAdapter` | `agent` | — | `install.sh` 检测 PATH |
 | `OpenCodeAdapter` | `opencode` | `~/.claude/skills/` + opencode.json | 自动 |
 | `PiAdapter` | `pi` | `~/.pi/agent/skills/<name>/SKILL.md` | `install.sh` 复制 + `install-skills` 子命令 |
+| `HostAdapter` | (无) | — | `--tool host`：prompt 落盘，由当前 agent 自己回答（见 docs/adapters.md） |
 
 ## 5. 测试 & 验证
 

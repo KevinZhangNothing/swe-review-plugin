@@ -20,6 +20,12 @@ from .subagents.verifier_agent import VerifierSubAgent, VerificationResult
 from .subagents.analyzer_agent import AnalyzerSubAgent, AnalyzerResult
 from .subagents.generator_agent import GeneratorSubAgent, GeneratedPR
 from .subagents.loop_agent import LoopSubAgent, LoopResult
+# stdlib-only module, so a top-level import carries no cycle risk
+from .subagents.location_grounding import ground_report_locations
+from .subagents.diff_sharding import (
+    DEFAULT_SHARD_BUDGET_CHARS,
+    DEFAULT_SHARD_CONCURRENCY,
+)
 
 
 @dataclass
@@ -104,7 +110,10 @@ class ReviewSkill:
 
     def __init__(self, tool_adapter=None, explore_skill: Optional[ExploreSkill] = None,
                  analyze_skill: Optional[AnalyzeSkill] = None,
-                 prompt_style: str = "engineering"):
+                 prompt_style: str = "engineering",
+                 shard_large_diffs: bool = True,
+                 shard_budget_chars: int = DEFAULT_SHARD_BUDGET_CHARS,
+                 shard_concurrency: int = DEFAULT_SHARD_CONCURRENCY):
         from .tools.base import BaseAdapter
         self.tool = tool_adapter or BaseAdapter()
         self.explore_skill = explore_skill or ExploreSkill()
@@ -114,6 +123,11 @@ class ReviewSkill:
             tool_adapter=self.tool,
             explorer=self.explore_skill.subagent,
             prompt_style=prompt_style,
+            # Large changes are fanned out to concurrent file-aligned shards so a
+            # single review request stays bounded (see subagents/diff_sharding.py).
+            shard_large_diffs=shard_large_diffs,
+            shard_budget_chars=shard_budget_chars,
+            shard_concurrency=shard_concurrency,
         )
 
     async def execute(
@@ -140,6 +154,9 @@ class ReviewSkill:
             "prompt_style": prompt_style or self.prompt_style,
         }
         report: ReviewReport = await self.subagent.execute(ctx)
+        # Deterministic grounding: verify/relocate finding locations against
+        # the real workspace before serialization (no LLM cost).
+        ground_report_locations(report, repo_path=repo_path)
         return SkillResult(
             ok=(report.decision in DECISION_CHOICES and not report.parse_error),
             payload=report.to_dict(deep=deep),
@@ -219,12 +236,18 @@ class VerifySkill:
         repo_path: Optional[str] = None,
         test_info: Optional[Dict[str, Any]] = None,
         oracle: Optional[str] = None,  # 仅评测用，永远不会进入 review prompt
+        test_runner: Optional[List[str]] = None,
     ) -> SkillResult:
+        """注意 payload.ok 的语义：它表示**补丁是否成功应用**（`patch_applied`），
+        不是"命令是否跑完"。工作区准备失败、补丁冲突都会给出 ok=False，而测试跑没跑、
+        过没过要看 payload 里的 `resolution_status` / `test_results`。
+        """
         res: VerificationResult = await self.subagent.execute({
             "pr_diff": pr_diff,
             "repo_path": repo_path,
             "test_info": test_info,
             "oracle": oracle,
+            "test_runner": test_runner,
         })
         return SkillResult(ok=res.patch_applied, payload=res.to_dict(), raw=res)
 
@@ -331,6 +354,8 @@ class LoopSkill:
         n_best_of: Optional[int] = None,
         prompt_style: Optional[str] = None,
         revision_feedback_level: Optional[str] = None,
+        test_info: Optional[Dict[str, Any]] = None,
+        test_runner: Optional[List[str]] = None,
     ) -> SkillResult:
         ctx = {
             "issue": issue,
@@ -341,6 +366,9 @@ class LoopSkill:
             "n_best_of": n_best_of or self.subagent.n_best_of,
             "prompt_style": prompt_style or self.prompt_style,
             "revision_feedback_level": revision_feedback_level or self.revision_feedback_level,
+            # Verifier-only evaluation metadata; never reaches review/revise.
+            "test_info": test_info,
+            "test_runner": test_runner,
         }
         res: LoopResult = await self.subagent.execute(ctx)
         return SkillResult(ok=res.success, payload=res.to_dict(), raw=res)

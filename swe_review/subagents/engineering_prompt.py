@@ -432,6 +432,37 @@ def truncate_json_text(ctx_json: str, limit: int = 60_000) -> str:
     return ctx_json[:cut] + "... (truncated)"
 
 
+def _shard_scope_section(shard: Dict[str, Any]) -> str:
+    """Scope header for a sharded review.
+
+    Load-bearing, not decoration: without it a shard reviewer reports "this file
+    is missing" / "not updated elsewhere" about files it simply cannot see — the
+    classic map-reduce false-positive mode. The prompt has to say so explicitly.
+    """
+    files = shard.get("files") or []
+    listing = "\n".join(f"- `{f}`" for f in files) or "- (no file headers parsed)"
+    oversized = (
+        "\n**Note**: this shard is a single file larger than the shard budget, so "
+        "it was not split further." if shard.get("oversized") else ""
+    )
+    return (
+        f"## SHARD {shard.get('index')} of {shard.get('total')} — REVIEW SCOPE\n"
+        "This request carries **only part of a larger change**: the diff below was "
+        "split by file so several reviewers can work in parallel.\n"
+        f"Files in THIS shard:\n{listing}{oversized}\n\n"
+        "Rules that follow from that:\n"
+        "- Report ONLY findings whose location is inside this shard's files.\n"
+        "- A file's hunks are never split across shards, so within these files you "
+        "have the complete change — judge it fully.\n"
+        "- Do NOT raise findings about files you cannot see: no \"missing file\", "
+        "\"not updated elsewhere\", or cross-file inconsistency claims. A later "
+        "synthesis step judges the change as a whole.\n"
+        "- Your output contract DIFFERS from a normal review — report findings "
+        "only (see the end of this message). Per-shard output is the dominant cost "
+        "of a sharded review, so extra fields slow the whole run down.\n\n"
+    )
+
+
 def user_prompt(
     issue: str,
     pr_title: str,
@@ -439,14 +470,17 @@ def user_prompt(
     pr_diff: str,
     repo_context: Dict[str, Any],
     analysis: Dict[str, Any],
+    shard: Optional[Dict[str, Any]] = None,
 ) -> str:
     ctx_json = truncate_json_text(json.dumps(repo_context, indent=2, ensure_ascii=False))
+    shard_section = _shard_scope_section(shard) if shard else ""
     return (
         "## Change Context / Intent\n"
         f"{issue}\n\n"
         "## PR Metadata\n"
         f"**Title**: {pr_title}\n"
         f"**Description**: {pr_body or 'N/A'}\n\n"
+        f"{shard_section}"
         "## Repository Context (collected by explorer)\n"
         f"{ctx_json}\n\n"
         "## Change Surface Analysis\n"
@@ -455,11 +489,48 @@ def user_prompt(
         "```diff\n"
         f"{pr_diff}\n"
         "```\n\n"
-        "## Your Task\n"
-        "1. 先理解 change surface 与上下文（caller / callee / state / architecture），"
-        "再推断 change intent。\n"
-        "2. 按 8 个维度评估，每个维度给出可追溯到代码证据的分数。\n"
-        "3. 生成 findings 前完成反事实验证与自检清单，删除主观/低价值项。\n"
-        "4. 检查 Hard Gate 条件，给出最终 decision。\n\n"
-        "Output ONLY the JSON object per schema."
+        f"{_shard_task_section() if shard else _FULL_TASK_SECTION}"
+    )
+
+
+_FULL_TASK_SECTION = (
+    "## Your Task\n"
+    "1. 先理解 change surface 与上下文（caller / callee / state / architecture），"
+    "再推断 change intent。\n"
+    "2. 按 8 个维度评估，每个维度给出可追溯到代码证据的分数。\n"
+    "3. 生成 findings 前完成反事实验证与自检清单，删除主观/低价值项。\n"
+    "4. 检查 Hard Gate 条件，给出最终 decision。\n\n"
+    "Output ONLY the JSON object per schema."
+)
+
+
+def _shard_task_section() -> str:
+    """Task + output contract for ONE shard.
+
+    Deliberately NARROWER than the full contract. A shard's scores, summary,
+    whats_good and recommended_actions are all discarded by the caller — a global
+    synthesis step decides them from the union of every shard's findings. Asking
+    for them anyway multiplied completion tokens ~6x (13.6k vs 2.3k on a real
+    run), which ate the entire benefit of running the shards in parallel and made
+    the sharded review *slower* than one call. Placed last on purpose: the
+    trailing instruction is the one models follow.
+    """
+    return (
+        "## Your Task (this shard only)\n"
+        "1. 先理解本片这几个文件的改动意图与上下文。\n"
+        "2. 逐条检查本片改动并产出 findings；每条都要有可追溯到代码的 "
+        "observation / evidence / why_it_matters / recommendation，"
+        "定位到本片文件与行号。\n"
+        "3. 检查 Hard Gate 条件，给出本片的 decision。\n\n"
+        "## Output contract — this is a SHARD, not a full review\n"
+        "Emit EXACTLY these keys and nothing else:\n"
+        '{"decision": {"recommendation": "approve|approve_with_suggestions|'
+        'request_changes|block", "confidence": 0.0-1.0},\n'
+        ' "findings": [ ...the normal finding shape... ],\n'
+        ' "hard_gate": {"triggered": false, "reason": ""}}\n\n'
+        "Do NOT emit `scores`, `total_score`, `summary`, `whats_good` or "
+        "`recommended_actions`. A later synthesis step decides every one of those "
+        "from the findings of ALL shards, so anything you put there is discarded — "
+        "it only makes the review slower and more expensive.\n\n"
+        "Output ONLY that JSON object."
     )

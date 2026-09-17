@@ -16,6 +16,7 @@ from .tools.cursor_adapter import CursorAdapter
 from .tools.opencode_adapter import OpenCodeAdapter
 from .tools.pi_adapter import PiAdapter
 from .tools.shell_tools import ShellTools
+from .tools.host_adapter import HostAdapter, HostTurnRequired, prompt_key
 from .tools.base import BaseAdapter
 
 __version__ = "1.0.0"
@@ -32,4 +33,5 @@ __all__ = [
     "GeneratorSubAgent", "GeneratedPR",
     "LoopSubAgent", "LoopResult", "LoopIteration",
     "ClaudeCodeAdapter", "CursorAdapter", "OpenCodeAdapter", "PiAdapter", "ShellTools", "BaseAdapter",
+    "HostAdapter", "HostTurnRequired", "prompt_key",
 ]

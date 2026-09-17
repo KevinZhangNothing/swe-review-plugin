@@ -13,14 +13,21 @@ NOTE:
 """
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
+
+
+def _one_line(text: str, fallback: str) -> str:
+    """Collapse git's multi-line stderr into a single informative line."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return " | ".join(lines[:4]) or fallback
 
 
 @dataclass
@@ -37,6 +44,41 @@ class VerificationResult:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+#: pytest's summary line, e.g. `3 failed, 2 errors in 4.1s` / `1 error in 1.19s`.
+#: The duration marker is what identifies a summary line — counting `\d+ errors`
+#: anywhere in the output also matched traceback prose ("ValueError: 3 errors
+#: occurred") and produced a misleading "the harness failed" diagnostic.
+_PYTEST_COUNT_RE = re.compile(r"(\d+)\s+(failed|passed|errors?|warnings?|skipped)",
+                              re.IGNORECASE)
+_PYTEST_DURATION_RE = re.compile(r"\bin\s+\d+(?:\.\d+)?s\b")
+
+
+def _pytest_summary_counts(stdout: str, stderr: str) -> Dict[str, int]:
+    """Counts from the LAST output line that carries pytest's duration marker."""
+    for line in reversed(f"{stdout or ''}\n{stderr or ''}".splitlines()):
+        if _PYTEST_DURATION_RE.search(line):
+            counts: Dict[str, int] = {}
+            for number, kind in _PYTEST_COUNT_RE.findall(line):
+                counts[kind.lower().rstrip("s")] = int(number)
+            return counts
+    return {}
+
+
+def _looks_like_harness_error(stdout: str, stderr: str) -> bool:
+    """True when pytest reported collection/fixture ERRORs but zero FAILUREs.
+
+    pytest exits non-zero for both, but only ERROR points at the harness rather
+    than at the code under test — a missing dependency, an unwritable temp dir, an
+    import-time crash. Treating the two as identical produced a false
+    `verification_failed` for a healthy candidate during a real loop run.
+
+    Deliberately pytest-specific: it reads pytest's own summary line, and returns
+    False for any other runner rather than guessing from stray keywords.
+    """
+    counts = _pytest_summary_counts(stdout, stderr)
+    return counts.get("error", 0) > 0 and counts.get("failed", 0) == 0
 
 
 class VerifierSubAgent:
@@ -81,11 +123,19 @@ class VerifierSubAgent:
         sandbox_used = False
         work_repo = self.repo_path
         tmp: Optional[Path] = None
-        if self.sandbox:
-            tmp = Path(tempfile.mkdtemp(prefix="swe-review-"))
+        # Structure note, because three independent reviews have misread it as a
+        # tmp-dir leak: this OUTER try/finally spans the whole method, so the
+        # `return` inside the inner `except` below still unwinds through the
+        # `finally: self._cleanup_sandbox(tmp)` at the end of the method. A
+        # copytree failure therefore does NOT leak a `swe-review-*` temp dir.
+        # Covered by tests/test_verifier_workspace.py::test_preparation_failure_stops_all_work
+        # (the `copy` parameter case) and test_sandbox_is_cleaned_when_patch_raises.
+        try:
             try:
-                # 只在沙箱里 shallow copy 文件，避开污染用户工作区
-                if self.repo_path.exists():
+                if not self.repo_path.is_dir():
+                    raise ValueError(f"Repository path is not a directory: {self.repo_path}")
+                if self.sandbox:
+                    tmp = Path(tempfile.mkdtemp(prefix="swe-review-"))
                     shutil.copytree(
                         self.repo_path,
                         tmp / "repo",
@@ -94,19 +144,26 @@ class VerifierSubAgent:
                     )
                     work_repo = tmp / "repo"
                     sandbox_used = True
-            except Exception:
-                work_repo = self.repo_path
-                sandbox_used = False
+            except Exception as exc:
+                # fail-closed; `tmp` (if created) is removed by the outer finally
+                return VerificationResult(
+                    passed=False,
+                    test_results=[],
+                    resolution_status="unknown",
+                    confidence=0.0,
+                    details=f"Failed to prepare verification workspace: {exc}",
+                    patch_applied=False,
+                    sandbox_used=False,
+                )
 
-        try:
-            patch_applied = self._apply_patch(pr_diff, work_repo)
+            patch_applied, apply_reason = self._apply_patch(pr_diff, work_repo)
             if not patch_applied:
                 return VerificationResult(
                     passed=False,
                     test_results=[],
                     resolution_status="unknown",
                     confidence=0.0,
-                    details="Failed to apply patch (syntax or context mismatch).",
+                    details=f"Failed to apply patch: {apply_reason}",
                     patch_applied=False,
                     sandbox_used=sandbox_used,
                 )
@@ -161,9 +218,17 @@ class VerifierSubAgent:
         if tmp and tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def _apply_patch(self, pr_diff: str, cwd: Path) -> bool:
+    def _apply_patch(self, pr_diff: str, cwd: Path) -> Tuple[bool, str]:
+        """Apply `pr_diff` in `cwd`, returning `(applied, reason)`.
+
+        `reason` carries git's own stderr. The previous boolean-only contract
+        reported every failure as "syntax or context mismatch", which hid the
+        actionable part: a malformed candidate is rejected by git with the exact
+        line number (`corrupt patch at line 54`), and a context mismatch names
+        the file that failed. Both are what a user needs to act on.
+        """
         if not pr_diff or not pr_diff.strip():
-            return False
+            return False, "empty diff"
         try:
             r = subprocess.run(
                 ["git", "apply", "--check", "-"],
@@ -174,7 +239,8 @@ class VerifierSubAgent:
                 timeout=20,
             )
             if r.returncode != 0:
-                return False
+                return False, _one_line(r.stderr or r.stdout,
+                                        "git apply --check rejected the patch")
             r2 = subprocess.run(
                 ["git", "apply", "-"],
                 input=pr_diff,
@@ -183,9 +249,11 @@ class VerifierSubAgent:
                 text=True,
                 timeout=20,
             )
-            return r2.returncode == 0
-        except Exception:
-            return False
+            if r2.returncode != 0:
+                return False, _one_line(r2.stderr or r2.stdout, "git apply failed")
+            return True, ""
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
 
     # ---- build check: 在 apply patch 之后、跑测试之前，先做编译/依赖检查 ----
 
@@ -302,29 +370,57 @@ class VerifierSubAgent:
 
         async def run_one(test_name: str, kind: str) -> Dict[str, Any]:
             templates = [runner] if runner else default_runners
+            attempts: List[str] = []
             for tmpl in templates:
                 if not tmpl:
                     continue
                 cmd = [c.replace("{test}", test_name) for c in tmpl]
                 try:
                     proc = await _run(cmd, cwd=str(cwd), timeout=self.test_timeout)
-                    return {
-                        "test": test_name,
-                        "type": kind,
-                        "should_pass": True,
-                        "passed": (proc["returncode"] == 0),
-                        "stdout_tail": proc["stdout"][-400:],
-                        "stderr_tail": proc["stderr"][-400:],
-                    }
-                except Exception:
+                except Exception as exc:
+                    attempts.append(f"{' '.join(cmd)}: {type(exc).__name__}: {exc}")
                     continue
+                timed_out = proc["returncode"] == -1 and proc["stderr"] == "timeout"
+                harness_error = _looks_like_harness_error(proc["stdout"], proc["stderr"])
+                if timed_out:
+                    error = "timeout"
+                    stderr_tail = f"runner timed out after {self.test_timeout}s"
+                elif harness_error:
+                    # Fail-closed semantics unchanged (`passed` is still False) —
+                    # only the diagnostic sharpens. Without this, a pytest
+                    # fixture/collection ERROR was indistinguishable from a real
+                    # test FAILURE and made the loop report `verification_failed`
+                    # for a candidate whose tests were in fact fine.
+                    error = "harness_error"
+                    stderr_tail = ("runner reported ERROR (collection/fixture), not "
+                                   "FAILED — the tests may not have run. Check the "
+                                   "harness before treating this as a code defect.\n"
+                                   + proc["stderr"][-400:])
+                else:
+                    error = None
+                    stderr_tail = proc["stderr"][-400:]
+                entry: Dict[str, Any] = {
+                    "test": test_name,
+                    "type": kind,
+                    "should_pass": True,
+                    "passed": (proc["returncode"] == 0),
+                    "runner_ok": True,
+                    "error": error,
+                    "stdout_tail": proc["stdout"][-400:],
+                    "stderr_tail": stderr_tail,
+                }
+                return entry
+            # Every template failed to start (or no template at all): the test
+            # never ran, so surface that instead of a bare ❌.
             return {
                 "test": test_name,
                 "type": kind,
                 "should_pass": True,
                 "passed": False,
+                "runner_ok": False,
+                "error": "runner_startup_failed",
                 "stdout_tail": "",
-                "stderr_tail": "no runner succeeded",
+                "stderr_tail": "; ".join(attempts) or "no runner templates",
             }
 
         for t in fail_to_pass:
@@ -375,6 +471,14 @@ class VerifierSubAgent:
         for r in test_results:
             mark = "✅" if r["passed"] else "❌"
             out.append(f"{mark} [{r['type']}] {r['test']}")
+        if all(not r.get("runner_ok", True) for r in test_results):
+            out.append("⚠️ No test runner could be started — tests never executed; "
+                       "this is an infrastructure failure, not a code failure.")
+        if any(r.get("error") == "harness_error" for r in test_results):
+            out.append("⚠️ The runner reported ERROR (collection/fixture) rather than "
+                       "FAILED — the tests may not have run at all. Debug the harness "
+                       "(missing deps, unwritable temp dir, import errors) before "
+                       "treating this as a code defect.")
         return "\n".join(out)
 
     # 仅供评测使用：单纯做 patch 形态对比，不进入 reviewer prompt

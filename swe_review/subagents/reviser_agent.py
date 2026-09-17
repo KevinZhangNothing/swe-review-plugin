@@ -10,11 +10,13 @@ Hard constraint: oracle / golden_patch / hidden tests are rejected at the
 context level to keep the reviser self-sufficient.
 """
 
+import asyncio
 import json
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, asdict
 
 from .engineering_prompt import strip_fences
+from .diff_validation import validate_unified_diff
 
 
 REVISION_FEEDBACK_LEVELS = ("full_feedback", "minimal_feedback", "baseline")
@@ -153,6 +155,8 @@ class ReviserSubAgent:
         config: Optional[Dict[str, Any]] = None,
         prompt_style: str = "concise",
         feedback_level: str = "full_feedback",
+        max_regen_attempts: int = 2,
+        regen_backoff_seconds: float = 2.0,
     ):
         # The reviser has no engineering-specific prompt; engineering-style
         # review feedback (P0-P4 findings mapped to defects) is evidence-rich,
@@ -172,6 +176,13 @@ class ReviserSubAgent:
         self.config = config or {}
         self.prompt_style = prompt_style
         self.feedback_level = feedback_level
+        # Long-form answers flake intermittently on hosted gateways — the same
+        # reason ReviewerSubAgent carries a bounded regen budget. Without it here,
+        # ONE malformed reviser response ends the whole loop: the empty diff makes
+        # LoopSubAgent break after the first review and discard the remaining
+        # iteration budget (observed live: a 3-iteration run stopped at 1).
+        self.max_regen_attempts = max(1, int(max_regen_attempts))
+        self.regen_backoff_seconds = max(0.0, float(regen_backoff_seconds))
         self.name = "reviser"
         self.capabilities = [
             "parse_feedback",
@@ -220,8 +231,20 @@ class ReviserSubAgent:
                 review_report=review_report,
             )
 
-        response, _ = await self._call_ai(system_prompt, user_prompt)
-        return self._parse_response(response, original_title, original_body, feedback_level)
+        # Bounded regen: one unparseable / empty answer must not be fatal to the
+        # loop. Every attempt re-sends the full prompt (the wasted call costs the
+        # same as the retry), and the last attempt's result is kept either way.
+        result: Optional[RevisedPR] = None
+        for attempt in range(1, self.max_regen_attempts + 1):
+            response, _ = await self._call_ai(system_prompt, user_prompt)
+            result = self._parse_response(response, original_title, original_body,
+                                          feedback_level)
+            if result.status != "failed":
+                break
+            if attempt < self.max_regen_attempts:
+                await asyncio.sleep(self.regen_backoff_seconds * attempt)
+        assert result is not None
+        return result
 
     def _build_user_prompt_concise(self, issue, original_title, original_body,
                                     original_diff, review_report):
@@ -259,6 +282,25 @@ class ReviserSubAgent:
             if not isinstance(addressed, list):
                 addressed = []
             ok = diff.startswith(("diff ", "diff --git", "--- ")) and "@@" in diff
+            # Structural check BEFORE the diff can leave the reviser. A malformed
+            # diff is worse than no diff: the reviewer only reads text, so it
+            # APPROVES it, and verify eventually rejects it with `corrupt patch` —
+            # after two full review passes, with no attempt left to fix it. (Seen
+            # twice in self-runs.) Returning an empty diff here lets the regen
+            # budget retry, and if it never succeeds the loop stops with an honest
+            # "revise produced no usable diff" instead of a late verify failure.
+            shape_problem = validate_unified_diff(diff) if diff.strip() else ""
+            if shape_problem:
+                return RevisedPR(
+                    title=data.get("title") or f"Revised: {original_title or 'patch'}",
+                    body=data.get("body") or original_body or "",
+                    diff="",
+                    changes_summary=f"revise rejected a malformed diff: {shape_problem}",
+                    addressed_defect_indices=[
+                        i for i in addressed if isinstance(i, int)],
+                    status="failed",
+                    feedback_level=feedback_level,
+                )
             return RevisedPR(
                 title=data.get("title") or f"Revised: {original_title or 'patch'}",
                 body=data.get("body") or original_body or "",

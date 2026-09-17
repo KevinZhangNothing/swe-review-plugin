@@ -15,6 +15,7 @@ from dataclasses import dataclass, asdict
 
 
 from .engineering_prompt import strip_fences, truncate_json_text
+from .diff_validation import validate_unified_diff
 
 
 # Candidate-generation perspectives for best_of_n diversity (swarm principle:
@@ -161,11 +162,18 @@ class GeneratorSubAgent:
             data = json.loads(cleaned)
             diff = data.get("diff", "") or ""
             ok = diff.startswith(("diff ", "diff --git")) and "@@" in diff
+            # A generated diff with wrong hunk arithmetic gets APPROVED by review
+            # (text only) and rejected by verify much later — the same failure the
+            # reviser guards against. Drop the diff so it cannot propagate.
+            shape_problem = validate_unified_diff(diff) if diff.strip() else ""
+            if shape_problem:
+                diff, ok = "", False
             return GeneratedPR(
                 title=data.get("title") or "fix:",
                 body=data.get("body") or "",
                 diff=diff,
-                rationale=data.get("rationale") or "",
+                rationale=((f"malformed diff rejected: {shape_problem}"
+                            if shape_problem else data.get("rationale") or "")),
                 confidence=float(data.get("confidence") or 0.5) if ok else 0.0,
             )
         except json.JSONDecodeError:

@@ -49,6 +49,30 @@ res = await skill.execute(
 print(res.payload["diff"])
 ```
 
+## Host mode — answer with the agent running this skill (preferred interactively)
+
+`--tool host` does **not** spawn `claude`/`pi`/`opencode`/`agent`. It writes the
+revision prompt to disk and expects **you** to answer it with your own model:
+
+```bash
+# 1) run; exits 3 with a JSON envelope naming the prompt that needs an answer
+swe-review revise --issue "..." --pr-diff pr.diff --review-report report.json \
+    --tool host --host-dir .swe-host
+
+# 2) read the prompt, answer it with YOUR OWN model (never spawn another CLI)
+swe-review host pending --host-dir .swe-host --show
+swe-review host answer --key <key> --text-file <your answer file>
+
+# 3) re-run the exact same command; answered prompts replay from cache
+swe-review revise --issue "..." --pr-diff pr.diff --review-report report.json \
+    --tool host --host-dir .swe-host
+```
+
+**What to answer:** the revised-PR JSON documented in the Output schema below —
+a `git apply`-compatible unified `diff`. Your raw model output is accepted
+directly, or `{"text": ..., "usage": {...}}` to also record token usage.
+Exit code 3 = awaiting host, 0 = done.
+
 ## Output schema
 
 ```json

@@ -11,6 +11,7 @@ OpenCode 在 stdout 干净时不需要 pty（避免 ANSI）；subprocess.run 更
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -25,8 +26,10 @@ from ._pty_runner import (
 
 
 def _find_cli() -> str:
+    # CLI_BIN_* is the legacy name install.sh used to write; kept for existing env files.
     return (
         os.environ.get("OPENCODE_BIN")
+        or os.environ.get("CLI_BIN_OPENCODE")
         or os.path.expanduser("~/.opencode/bin/opencode")
         or shutil.which("opencode")
         or "opencode"
@@ -67,7 +70,13 @@ class OpenCodeAdapter:
         # 同时避免 unknown-server 错）。
         argv = [self.cli_path, "run", full_prompt]
 
-        out, err, rc = run_subprocess(argv, timeout=self.timeout, extra_env=env)
+        # to_thread, NOT a direct call: `run_subprocess` is synchronous, so calling
+        # it straight from this coroutine blocks the event loop for the subprocess's
+        # whole lifetime, silently serialising every `asyncio.gather` in the project
+        # (best_of_n's candidate wave, the shard fan-out, health probes).
+        out, err, rc = await asyncio.to_thread(
+            run_subprocess, argv, timeout=self.timeout, extra_env=env,
+        )
         text_clean = strip_ansi(out)
         if rc != 0:
             err_tail = (err or text_clean)[-500:]

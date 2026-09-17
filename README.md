@@ -59,6 +59,7 @@ flowchart TB
         CA[CursorAdapter<br/><i>agent --print</i>]
         OA[OpenCodeAdapter<br/><i>opencode run</i>]
         PA[PiAdapter<br/><i>pi --mode print</i>]
+        HA[HostAdapter<br/><i>prompt 落盘，宿主自答</i>]
         ST[ShellTools<br/><i>离线占位</i>]
     end
 
@@ -189,6 +190,10 @@ flowchart TB
     SEED --> RG_FALLBACK["Review‑Guided(seed_pr, max_iter)"]
     RG_FALLBACK --> DONE
 ```
+
+传入 `initial_pr`（`--initial-pr-diff`）时 hybrid **跳过 best_of_n 阶段**，直接进入
+Review‑Guided：显式给出的候选补丁就是「要审这份」，先生成 N 个新候选只会把调用方
+传入的补丁静默丢弃。此时 `--n-best-of` 不生效。
 
 ### 2.5 完整序列（review_guided 策略）
 
@@ -517,6 +522,12 @@ engineering 报告同时把 findings 映射为 legacy `defects`（P0/P1→high�
 
 所有 SubAgent 接收的 `context` 字典是显式 schema —— **拒绝** `golden_patch`、`test_info`、`oracle` 等污染字段（验证器除外）。
 
+同级还有一个**纯函数模块**（不是 SubAgent，因为分片必须确定性）：
+
+| 模块 | 作用 |
+|------|------|
+| `diff_sharding` | 把大 diff 按文件切成预算内的分片（`plan_shards` / `should_shard` / `split_file_blocks`），供 `ReviewerSubAgent` 做并发 map-reduce 审查 |
+
 ### 5.3 Adapter 层（`swe_review/tools/`）
 
 只负责 `chat(system, user) → (text, token_usage)`。所有 adapter 共享 `BaseAdapter` 接口：
@@ -532,17 +543,18 @@ class BaseAdapter:
 
 ```mermaid
 flowchart TB
-    subgraph Adapters["5 个 Adapter"]
+    subgraph Adapters["6 个 Adapter"]
         CCA["ClaudeCodeAdapter<br/><i>子进程: claude -p</i>"]
         CA["CursorAdapter<br/><i>子进程: agent --print --trust</i>"]
         OA["OpenCodeAdapter<br/><i>子进程: opencode run</i>"]
         PA["PiAdapter<br/><i>子进程: pi --mode print -p</i>"]
+        HA["HostAdapter<br/><i>不 spawn CLI<br/>prompt 落盘，宿主自答</i>"]
         ST["ShellTools<br/><i>离线 JSON 占位<br/>无 LLM 调用</i>"]
     end
 
     subgraph Common["公共基础设施"]
         BP[_pty_runner.py<br/><i>PTY 子进程管理</i>]
-        SB[shelL_tools.py<br/><i>shell 命令工具</i>]
+        SB[shell_tools.py<br/><i>shell 命令工具</i>]
     end
 
     Adapters --> Common
@@ -554,6 +566,7 @@ flowchart TB
 | `CursorAdapter` | `agent` | `agent --print --trust` | ❌ |
 | `OpenCodeAdapter` | `opencode` | `opencode run` | ❌ |
 | `PiAdapter` | `pi` | `pi --mode print -p --system-prompt ...`（系统提示替换 pi 默认 coding-assistant prompt，避免模型在 `--no-tools` 下仍输出 `<tool_call>`） | ✅ → `~/.pi/agent/skills/` |
+| `HostAdapter` | (无) | **不 spawn 任何 CLI**：prompt 落盘，由「正在运行的 agent」自己回答（见 §6 Host mode） | — |
 | `ShellTools` | (无) | 返回占位 JSON | ❌ |
 
 ---
@@ -566,19 +579,149 @@ swe-review health                                      # 每个 adapter 发一�
 swe-review install-skills [--source ...] [--pi-skills-dir ...]
 
 swe-review review    --issue ... --pr-diff ... \
-                     [--tool pi] [--prompt-style engineering|concise|detailed] [--deep]
+                     [--tool pi] [--prompt-style engineering|concise|detailed] [--deep] \
+                     [--timeout 1200] [--no-shard] [--shard-budget 400000] \
+                     [--shard-concurrency 4]
 
 swe-review revise    --issue ... --pr-diff ... \
-                     --review-report ... [--feedback-level full_feedback]
+                     --review-report ... [--feedback-level full_feedback] [--timeout 1200]
 
 swe-review loop      --issue ... --repo-path . \
-                     [--strategy hybrid] [--max-iterations 5] [--n-best-of 3]
+                     [--strategy hybrid] [--max-iterations 5] [--n-best-of 3] [--timeout 600] \
+                     [--no-shard] [--shard-budget 400000] [--shard-concurrency 4]
 
 swe-review verify    --pr-diff ... \
-                     [--repo-path .] [--sandbox] [--test-info ...] [--oracle ...]
+                     [--repo-path .] [--sandbox] [--test-info ...] [--oracle ...] \
+                     [--test-runner "python -m pytest {test} -q"]
 ```
 
-完整参数见 `swe-review -h`。
+完整参数见 `swe-review -h`。`--timeout` 省略时各 adapter 保留自己的默认值
+（claude-code/opencode 1800s，pi/cursor 600s）；engineering 审查一份大 diff 常需
+6–9 分钟，用 pi 时建议显式给 `--timeout 1200` 以上。`verify` 不需要 `--tool`
+（它不调 LLM）。
+
+### 大 diff 自动分片（map-reduce 审查）
+
+review prompt 的体积**几乎全由原始 diff 决定**（实测一份 180 KB 的 diff 占 98%，
+单次 prompt ≈ 45.6k tokens）。而 `pr_diff` 曾是唯一**没有任何预算**的 prompt 输入
+（repo_context 60k、exploration 40k、reviser diff 50k 都有上限）。于是超大改动会
+直接把上下文顶爆，且整轮审查串行压进一次请求。
+
+现在超过 `--shard-budget`（默认 400k 字符，见下方实测取舍）的改动才会按**文件**切成
+若干片**并发**审查，再归并：
+
+```
+        一个 180 KB / 42 文件的 diff
+                    │
+        ┌───────────┴───────────┐  plan_shards() 确定性切分
+        │  按文件打包，绝不切开一个文件或一个 hunk
+        └───────────┬───────────┘
+    ┌───────┬───────┼───────┬───────┐   asyncio.gather（受 --shard-concurrency 限制）
+  shard1  shard2  shard3  shard4      各自带上「SHARD k/N + 本片文件清单」的作用域说明
+    └───────┴───────┼───────┴───────┘
+                    │  merge_findings()：并集 + 去重 + 按严重度排序（纯代码，不经模型）
+                    ▼
+          一次 synthesis 调用 → 全局 8 维评分 / decision / hard_gate / summary
+```
+
+要点：
+
+- **切分是确定性的**（`subagents/diff_sharding.py`，不调 LLM）：按 diff 顺序把文件
+  打包到预算内，**一个文件的 hunk 绝不跨片**（只看半个文件会凭空产出「缺失」类
+  findings），**hunk 绝不切开**；单个文件超过预算则独立成片并标记 `oversized`。
+- **作用域说明是必需的**，不是装饰：每片的 prompt 明确写「本片只有 k/N 个文件，
+  不要对看不到的文件提『缺失/不一致』」。少了这句，分片审查必然产出跨文件假阳性。
+- **分片的输出契约与整轮审查不同**：分片只产 `decision` / `findings` / `hard_gate`，
+  **不产** 8 维评分与 summary。这些会被后续 synthesis 覆盖，要求分片产出只会让每片的
+  completion 涨到接近整轮的量级——实测这会把并行的收益全部吃掉（4 片 13.6k
+  completion tokens vs 单次 2.3k）。契约写在 prompt **末尾**（末尾指令模型才会遵守）。
+- **findings 由确定性代码归并**——证据在哪片，就只有那片有，所以决定一条 finding
+  去留的绝不能是模型。synthesis 只负责**判断**（评分/decision/summary），并且它
+  产出的 findings 会被丢弃、由归并结果覆盖。
+- **降级路径**：某片解析失败 → 记入 `summary.degraded_shards` 并继续；synthesis
+  不可用 → 退回**确定性最坏值聚合**（decision 取最严；分片只产 findings 时没有评分可
+  聚合，此时会在 summary 里显式声明「scores are unavailable」而不是悄悄给一份没分数的
+  报告）；所有片都失败 → 返回 `request_changes` + `parse_error`，**绝不伪造 approve**。
+- 只对 **engineering** 风格生效；concise/detailed 有各自的 prompt 体系，硬套会让
+  审查语义悄悄改变。预算低于 1000 会被抬到 1000。
+
+#### ⚠️ 关于「并发应该更快」：实测不会（除非单次调用装不下）
+
+一个自然的预期是「总工作量增加了，但可以并发，所以墙钟时间应该下降」。**本项目的实测
+不支持这个结论**，原因值得写清楚，因为它决定了这个功能该怎么用。
+
+同一份 271 KB / 42 文件的改动，**每次调用的 prompt 都带随机 nonce 以保证不被缓存**
+（见下方缓存警告）：
+
+| | 单次调用 | 分片（5 片 + 综合） |
+|---|---|---|
+| 墙钟 | **35.5 s** | **71.5 s**（约 2×） |
+| 峰值单请求 prompt | 69 k tokens（**随 diff 线性增长，无上限**） | ~每片 15–30 k（**与总量解耦**） |
+| 总 completion | 2,341 | 8,424（**3.6×**） |
+
+**为什么并发没换来提速**：只有「同一份工作切成 N 份」时 `工作/N` 才成立。而 fan-out
+在这里**不切分工作，而是增加工作**——每片都要写出自己那份 findings 报告，另外还有一次
+**串行**的综合调用要再写一份完整报告。墙钟由**输出生成**决定（不是 prompt 大小），所以
+总输出涨到 3.6 倍时，并行的收益不可能覆盖它。
+
+关键路径因此是：
+
+```
+墙钟 ≈ max(单片的时延) + 综合调用的时延      ← 后者是硬屏障，必须等所有片结束
+```
+
+实测两者量级相当（单片阶段 33–37 s，综合 20–45 s），所以合计必然大于单次调用。
+
+**它真正的价值是「单次调用装不下」**：那时替代方案是报错或极慢的请求，而分片把每个
+请求的 prompt 压回窗口内。所以默认阈值设在接近 128 k 窗口的位置（400 k 字符 ≈ 100 k
+tokens 的 diff），**而不是「稍大就分片」**。
+
+| 场景 | 用法 |
+|---|---|
+| 默认：仅在单次调用有超窗风险时分片 | 不传（400k） |
+| 接受更慢的墙钟，换取最紧的峰值 prompt | `--shard-budget 60000` |
+| 最低总成本，且 diff 装得下 | `--no-shard` |
+
+**两个已知的可优化点**（都没做，因为都不改变上面的量级结论）：
+
+1. **综合调用偶发会重试**（`max_regen_attempts`，默认 3 次）。每次重试都是一次完整的
+   报告生成，会把这道屏障的耗时放大到 3 倍。孤立复现时它一次即成功（20.9 s、1 次调用），
+   所以是偶发；一旦触发，分片的墙钟会明显恶化。
+2. **减少总输出**才是唯一能真正提速的方向：例如让分片只回结构化 findings（不写散文），
+   或把综合的 `whats_good`/`recommended_actions` 改为由各片 findings 确定性汇总。
+
+⚠️ **缓存警告（会影响任何 A/B 测评）**：`pi` CLI 会按 prompt 缓存响应——同一条 prompt
+第二次调用实测 2.86 s → 0.32 s（快 9 倍）。任何复用 prompt 的对比测量都是无效的，必须
+在 prompt 里放随机 nonce。
+
+（对照：上游**确实**并行服务并发请求——5 条各不相同的请求并发耗时是单条的 1.57×，
+而非 5×。所以瓶颈不在上游，而在上面的工作量与屏障结构。）
+
+⚠️ **分片与单次调用的评分不可直接比较**：分片时每片只看到自己那几个文件，全局判断由
+综合调用基于 findings 重新作出，所以 `total_score` 会与单次调用有差异（实测 84 vs 66）。
+把评分当作门禁时请固定一种模式。
+
+`swe-review review` 的输出会在 `summary.sharded_review` 写明实际片数、有无
+`oversized` 片、以及是否退回了确定性聚合（有片失败时另有
+`summary.degraded_shards`），便于判断这次到底走了哪条路径。
+
+### Host mode（`--tool host`）：让当前 agent 自己当 LLM
+
+不 spawn `claude`/`pi`/`opencode` —— prompt 落盘，由**正在运行本命令的 agent**
+用自己的模型回答，然后原样重跑同一命令继续：
+
+```bash
+swe-review loop --issue "Fix NaN" --repo-path . --tool host --host-dir .swe-host
+# 退出码 3 = awaiting_host：stdout 给出 key + request_path + 指引
+swe-review host pending  --host-dir .swe-host --show          # 读待答 prompt
+swe-review host answer   --host-dir .swe-host --key <key> --text-file ans.json
+swe-review loop --issue "Fix NaN" --repo-path . --tool host --host-dir .swe-host
+# 已答 prompt 从缓存重放，循环推进到下一阶段；退出码 0 = 完成
+```
+
+`--agent` 只是把标签写进 request（如 `--agent cline`）。答案可以直接用模型的裸
+输出，或 `{"text": ..., "usage": {...}}` 记录 token。任何 agent（不限那 4 款 CLI）
+都能这样驱动 `review` / `revise` / `loop`；无人值守场景仍用 4 个 CLI adapter。
 
 ### CLI 层架构
 
@@ -677,6 +820,20 @@ flowchart LR
 
 注：本仓库不下载 SWE-bench 数据集；评测脚本请按你本地 SWE-Review-Bench 接入即可。
 
+### 测墙钟/成本时必须先排除缓存
+
+`pi` CLI 会按 prompt 缓存响应。实测**同一条 prompt**：首次 2.86 s，第二次 **0.32 s**
+（快 9 倍）。因此：
+
+- 任何复用 prompt 的 A/B 对比都是无效的——**必须在 prompt 里放随机 nonce**；
+- 这类污染很容易伪造出「并发没有变慢」的假象（本项目自己就中过一次：一次「分片仅慢
+  12%」的结论是缓存命中造成的，真实值是 2× 慢）；
+- 报告耗时/成本时请连同 nonce 与 token 计数一起给出，单看秒数不可复现。
+
+同时注意**墙钟由输出生成决定**，不是 prompt 大小：一次调用的耗时 ≈ 输出 token 数 ÷
+生成速率，与输入规模关系较弱。所以「把输入切小并并发」不会自动缩短墙钟——除非总输出
+也下降。
+
 ---
 
 ## 9. 安全约束与不变式
@@ -694,8 +851,18 @@ flowchart LR
 | Reviewer 输出必须是可解析 JSON | `ReviewerSubAgent._parse_response()` | fallback `request_changes` |
 | Reviewer 输出内容不得为“空心载荷”（scores 越界/大面积 null、findings 无证据） | `reviewer_agent._parse_engineering_payload()` sanity gate | 视为解析失败，触发 regen/repair 重试 |
 | 不可信 review（parse_error / truncated_repair / 空心）不得 approve | `LoopSubAgent` | approve 暂扣，进入 revise/扩张 |
+| review_guided 审查通过不能覆盖验证失败（含 hybrid 回退阶段） | `LoopSubAgent._run_review_guided()` | 返回 `success=False`、`final_decision="verification_failed"`，保留候选 diff 与失败详情，不自动修订 |
 | best_of_n 的 success 必须 verify 通过 | `LoopSubAgent._run_best_of_n()` evidence-first 裁决 | verify 失败穿透到下一候选 |
+| finding location 必须确定性 grounding（可选仓库路径时） | `location_grounding.ground_report_locations()` | 路径不存在→唯一 basename 重定位（记录 `relocated_from`）或标注 `verified=False`；越界行标注 `line_verified=False`；只标注不丢弃，不调用 LLM |
+| flat location 字符串会被追加注解后缀（**可观测的 schema 变更**） | `location_grounding._ground_flat()` | `path:line` → `path:line [verified]` / `[unverified]` / `[relocated_from:…;line-verified]`。按裸 `path:line` 解析 `defects[].location` 的下游会看到后缀；需要机器可读定位请用 `--deep`（dict 形态，带 `verified` / `line_verified` / `file_lines` 显式字段）。同一 location 二次 grounding 幂等，不叠加后缀 |
+| grounding 不得读取仓库外文件 | `location_grounding._resolve()` containment 检查 | 绝对路径 / `..` 穿越一律不读盘、不泄漏行数，仅可仓库内 basename 重定位 |
 | best_of_n wave 内单候选异常不得掀翻整个 wave | `asyncio.gather(return_exceptions=True)` | 失败候选降级为不可信拒绝 |
+| 大 diff 必须按文件无损分片（超预算时） | `diff_sharding.plan_shards()` | 一文件的 hunk 不跨片、hunk 不切开、单文件超预算独立成片并标 `oversized`；切分确定性、hunk 与 ± 行守恒；`--no-shard` 可关闭 |
+| 分片 findings 的取舍不得交给模型 | `reviewer_agent.merge_findings()` | 并集 + 去重 + 按严重度排序，全部由代码完成；synthesis 调用产出的 findings 被丢弃并由归并结果覆盖；synthesis 不可用 → 退回确定性最坏值聚合（decision 取最严、每维取最低分）；全部片失败 → `request_changes` + `parse_error`，绝不伪造 approve |
+| 分片审查必须声明作用域 | `engineering_prompt._shard_scope_section()` | 每片 prompt 注明 `SHARD k/N` 与本片文件清单，并禁止对看不到的文件提「缺失/不一致」——否则必然产出跨文件假阳性 |
+| 分片的输出契约必须是 findings-only | `engineering_prompt._shard_task_section()` | 分片只产 `decision`/`findings`/`hard_gate`；评分与 summary 由 synthesis 决定。要求分片产出完整报告会让每片的 completion 接近整轮量级，吃掉并行的全部收益 |
+| adapter 不得阻塞事件循环 | 四个 CLI adapter 用 `await asyncio.to_thread(run_subprocess / run_in_pty, …)` | `run_subprocess`/`run_in_pty` 是同步函数；直接调用会让事件循环被阻塞整个子进程生命周期，使项目里**每一处 `asyncio.gather`**（best_of_n 候选波、大 diff 分片、health 探针）表面并发、实际串行。`tests/test_adapters.py::test_cli_adapter_chat_does_not_block_the_event_loop` 强制这一点 |
+| 模型产出的 diff 必须过结构校验才准离开 producer | `diff_validation.validate_unified_diff()`，在 `ReviserSubAgent._parse_response` / `GeneratorSubAgent._parse` 中调用 | hunk 算术不对（`@@ -a,b +c,d @@` 与正文行数不符）的 diff，review 会**读文本并批准**它，直到 verify 才以 `corrupt patch` 拒绝——此时已烧掉两轮 review 且没有重试机会。校验器在**产出点**拦下并触发 regen 重试；不通过则交付空 diff，让闭环以诚实的 `revise produced no usable diff` 停止。注意它**必要但不充分**（只查算术，完整可应用性仍需仓库上下文，由验证器裁定） |
 
 ### Verifier 沙箱流程
 
@@ -705,12 +872,13 @@ flowchart TB
     SANDBOX -->|Yes| MKTMP["mkdtemp(prefix=swe-review-)"]
     MKTMP --> COPY["shutil.copytree(repo → tmp/repo)<br/>ignore .git / __pycache__ / node_modules"]
     COPY -->|成功| WORK["work_repo = tmp/repo"]
-    COPY -->|失败| FALLBACK["work_repo = original repo<br/>sandbox_used = False"]
+    COPY -->|失败| PREP_FAIL["return VerificationResult<br/>passed=False, patch_applied=False<br/>sandbox_used=False, resolution_status=unknown"]
+    MKTMP -->|失败| PREP_FAIL
 
     SANDBOX -->|No| ORIG["work_repo = original repo"]
 
     WORK --> APPLY["git apply --check → git apply"]
-    FALLBACK --> APPLY
+    PREP_FAIL --> FINALLY
     ORIG --> APPLY
 
     APPLY --> OK{成功?}

@@ -92,6 +92,10 @@ adapters:
   - name: shell
     class: swe_review.tools.shell_tools:ShellTools
     note: "No LLM — placeholder for offline tests."
+  - name: host
+    class: swe_review.tools.host_adapter:HostAdapter
+    cli: (none)
+    note: "Prompts go to disk; the agent running the command answers them. --tool host"
 
 invariants:
   no_golden_patch_to_reviewer: true

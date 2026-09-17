@@ -147,19 +147,33 @@ class LoopSubAgent:
         n_best = int(context.get("n_best_of", self.n_best_of))
         prompt_style = context.get("prompt_style")
         feedback_level = context.get("revision_feedback_level")
+        # Evaluation metadata reaches the verifier — and ONLY the verifier
+        # (docs/security.md §1). It travels through this path or not at all:
+        # without the plumbing below, every loop verify degraded to a
+        # patch-application check and `resolve_rate` was structurally stuck at
+        # 0.0, which silently hollowed out the "V" of the loop and made the RRR
+        # metric unmeasurable through the CLI.
+        test_info = context.get("test_info")
+        test_runner = context.get("test_runner")
 
         if strategy == "best_of_n":
             r = await self._run_best_of_n(issue, repo_path, n_best, t0,
-                                          prompt_style=prompt_style)
+                                          prompt_style=prompt_style,
+                                          test_info=test_info,
+                                          test_runner=test_runner)
         elif strategy == "hybrid":
             r = await self._run_hybrid(issue, repo_path, initial_pr, n_best, t0,
                                        max_iter=max_iter,
                                        prompt_style=prompt_style,
-                                       feedback_level=feedback_level)
+                                       feedback_level=feedback_level,
+                                       test_info=test_info,
+                                       test_runner=test_runner)
         else:
             r = await self._run_review_guided(issue, repo_path, initial_pr, max_iter, t0,
                                               prompt_style=prompt_style,
-                                              feedback_level=feedback_level)
+                                              feedback_level=feedback_level,
+                                              test_info=test_info,
+                                              test_runner=test_runner)
 
         r.elapsed_seconds = (datetime.now() - t0).total_seconds()
         if self.output_dir:
@@ -178,10 +192,17 @@ class LoopSubAgent:
         t0: datetime,
         prompt_style: Optional[str] = None,
         feedback_level: Optional[str] = None,
+        test_info: Optional[Dict[str, Any]] = None,
+        test_runner: Optional[List[str]] = None,
     ) -> LoopResult:
         iterations: List[LoopIteration] = []
         token_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         current_pr = initial_pr or {}
+        # Why the loop stopped. Default matches "the for-loop ran to completion";
+        # every early `break` overwrites it, so the reported reason is never a
+        # guess. (It used to be hard-coded to "max iterations reached", which
+        # mislabelled revisions that died on iteration 1.)
+        stop_reason = f"max iterations reached ({max_iter})"
 
         # 如果没有 initial_pr 且有 generator，则先生成一个
         if not current_pr.get("diff") and self.generator_skill:
@@ -231,30 +252,36 @@ class LoopSubAgent:
             # A truncated or unparseable-then-failed review cannot guarantee the
             # lost tail held no P0 — withhold approve and force another revision.
             if not rev_unreliable and rev.get("decision") in DECISION_APPROVING:
-                # 如有 verifier，跑一次验证作为 RRR 信号
-                rr = await self._verify(current_pr, repo_path)
+                # Approval is insufficient when a configured verifier fails.
+                # _verify retains the existing no-tests weak-pass policy.
+                rr = await self._verify(current_pr, repo_path,
+                                        test_info=test_info, test_runner=test_runner)
+                verification_failed = rr is not None and not rr["passed"]
                 if rr:
                     iterations.append(self._mk_iter(i, "verify",
-                                                    "approve" if rr["passed"] else "review_failed",
+                                                    "verification_failed" if verification_failed else "approve",
                                                     rr["confidence"], 0, notes=rr["details"]))
                 return LoopResult(
-                    success=True,
-                    final_decision=rev.get("decision", "approve"),
+                    success=not verification_failed,
+                    final_decision="verification_failed" if verification_failed else rev.get("decision", "approve"),
                     final_pr_diff=current_pr.get("diff", ""),
                     total_iterations=len(iterations),
                     iterations=iterations,
                     resolve_rate=rr["resolve_rate"] if rr else 0.0,
                     token_usage_total=token_total,
                     strategy="review_guided",
-                    message=f"approved at iteration {i}",
+                    message=(f"verification failed at iteration {i}: {rr['details']}"
+                             if verification_failed else f"approved at iteration {i}"),
                 )
 
             # 2) reach max, 提前 stop
             if self.early_stop and i >= max_iter:
+                stop_reason = f"max iterations reached ({max_iter})"
                 break
 
             # 3) revise
             if not self.revise_skill:
+                stop_reason = "no reviser configured — cannot act on the review"
                 break
             new_pr = await self._revise(issue, current_pr, rev.get("defects", []), repo_path,
                                         decision=rev.get("decision", "request_changes"),
@@ -265,16 +292,22 @@ class LoopSubAgent:
                 iterations.append(self._mk_iter(
                     i, "revise", "failed", 0.0, 0,
                     notes=f"empty diff (revise status={why})"))
+                # Report the real reason: claiming "max iterations reached" here
+                # was actively misleading — the loop stopped after ONE review
+                # because the reviser returned nothing.
+                stop_reason = (f"revise produced no usable diff at iteration {i} "
+                               f"(reviser status={why})")
                 break
             iterations.append(self._mk_iter(i, "revise", "ok",
                                             0.5, len(rev.get("defects", [])), notes=new_pr.get("changes_summary", "")))
             current_pr = new_pr
 
         # 未通过：跑 verifier（如提供）以拿到 RRR
-        rr = await self._verify(current_pr, repo_path)
+        rr = await self._verify(current_pr, repo_path,
+                                test_info=test_info, test_runner=test_runner)
         if rr:
             iterations.append(self._mk_iter(len(iterations) + 1, "verify",
-                                            "approve" if rr["passed"] else "request_changes",
+                                            "verification_failed" if not rr["passed"] else "approve",
                                             rr["confidence"], 0, notes=rr["details"]))
 
         return LoopResult(
@@ -286,7 +319,7 @@ class LoopSubAgent:
             resolve_rate=rr["resolve_rate"] if rr else 0.0,
             token_usage_total=token_total,
             strategy="review_guided",
-            message=f"max iterations reached ({max_iter})",
+            message=stop_reason,
         )
 
     # ==================================================================
@@ -299,6 +332,8 @@ class LoopSubAgent:
         n: int,
         t0: datetime,
         prompt_style: Optional[str] = None,
+        test_info: Optional[Dict[str, Any]] = None,
+        test_runner: Optional[List[str]] = None,
     ) -> LoopResult:
         """Wave-based best-of-N (swarm-style).
 
@@ -412,11 +447,12 @@ class LoopSubAgent:
         approved = sorted((c for c in candidates if c["approved"]),
                           key=lambda c: -c["confidence"])
         for c in approved:
-            rr = await self._verify(c["pr"], repo_path)
+            rr = await self._verify(c["pr"], repo_path,
+                                    test_info=test_info, test_runner=test_runner)
             if rr:
                 iterations.append(self._mk_iter(
                     len(iterations) + 1, "verify",
-                    "approve" if rr["passed"] else "review_failed",
+                    "verification_failed" if not rr["passed"] else "approve",
                     rr["confidence"], 0, notes=rr["details"]))
                 resolve_rate = max(resolve_rate, rr["resolve_rate"])
             if rr and rr["passed"]:
@@ -438,11 +474,12 @@ class LoopSubAgent:
         for c in rest[:2]:
             if not c["pr"].get("diff"):
                 continue
-            rr = await self._verify(c["pr"], repo_path)
+            rr = await self._verify(c["pr"], repo_path,
+                                    test_info=test_info, test_runner=test_runner)
             if rr:
                 iterations.append(self._mk_iter(
                     len(iterations) + 1, "verify",
-                    "approve" if rr["passed"] else "request_changes",
+                    "verification_failed" if not rr["passed"] else "approve",
                     rr["confidence"], 0, notes=rr["details"]))
                 resolve_rate = max(resolve_rate, rr["resolve_rate"])
             if rr and rr["passed"]:
@@ -477,10 +514,38 @@ class LoopSubAgent:
         max_iter: Optional[int] = None,
         prompt_style: Optional[str] = None,
         feedback_level: Optional[str] = None,
+        test_info: Optional[Dict[str, Any]] = None,
+        test_runner: Optional[List[str]] = None,
     ) -> LoopResult:
         n = min(n, 3)
+        # An explicit initial PR means "review/revise THIS candidate" — the
+        # documented self-review contract of `--initial-pr-diff`. Running the
+        # best_of_n generation phase first would silently discard the patch the
+        # caller supplied (its seed came from the generated winner), so the
+        # generation phase is skipped entirely when a diff is provided.
+        if initial_pr and initial_pr.get("diff"):
+            rg = await self._run_review_guided(
+                issue, repo_path, initial_pr, max_iter or self.max_iterations, t0,
+                prompt_style=prompt_style,
+                feedback_level=feedback_level,
+                test_info=test_info,
+                test_runner=test_runner,
+            )
+            rg.strategy = "hybrid"
+            # Record the skipped phase explicitly: without it the timeline opens
+            # with a `review` iteration, so "why was no candidate generated?"
+            # cannot be answered from the LoopResult alone.
+            rg.iterations.insert(0, self._mk_iter(
+                0, "generate", "skipped", 0.0, 0,
+                notes="hybrid: initial_pr supplied — best_of_n generation skipped"))
+            rg.total_iterations = len(rg.iterations)
+            rg.message = (f"hybrid: initial PR supplied → best_of_n skipped; "
+                          f"{rg.message}")
+            return rg
         bon = await self._run_best_of_n(issue, repo_path, n, t0,
-                                        prompt_style=prompt_style)
+                                        prompt_style=prompt_style,
+                                        test_info=test_info,
+                                        test_runner=test_runner)
         if bon.success:
             bon.strategy = "hybrid"
             bon.message = f"hybrid: best_of_n approved in {n} candidates"
@@ -490,11 +555,13 @@ class LoopSubAgent:
         rg = await self._run_review_guided(issue, repo_path, seed_pr,
                                            max_iter or self.max_iterations, t0,
                                            prompt_style=prompt_style,
-                                           feedback_level=feedback_level)
+                                           feedback_level=feedback_level,
+                                           test_info=test_info,
+                                           test_runner=test_runner)
         rg.strategy = "hybrid"
         rg.iterations = bon.iterations + rg.iterations
         rg.total_iterations = len(rg.iterations)
-        rg.message = "hybrid: best_of_n failed → review_guided took over"
+        rg.message = f"hybrid: best_of_n failed → review_guided took over; {rg.message}"
         return rg
 
     # ==================================================================
@@ -570,13 +637,19 @@ class LoopSubAgent:
 
     async def _verify(
         self, pr: Dict[str, Any], repo_path: Optional[str],
+        test_info: Optional[Dict[str, Any]] = None,
+        test_runner: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not self.verifier_skill:
             return None
-        # 注意：verifier 可以接收 oracle（评测用），但不允许来自 prompt 链路
+        # 注意：verifier 可以接收 oracle / test_info（评测用），但不允许来自 prompt 链路。
+        # test_info 是让 `resolution_status` 变成 resolved/not_resolved 的**唯一**输入：
+        # 不传它，验证就退化成 apply-only，resolve_rate 结构性恒为 0。
         out = await self.verifier_skill.execute(
             pr_diff=pr.get("diff", ""),
             repo_path=repo_path,
+            test_info=test_info,
+            test_runner=test_runner,
         )
         d = _unwrap_skill(out)
         status = d.get("resolution_status")
