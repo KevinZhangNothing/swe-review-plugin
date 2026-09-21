@@ -59,6 +59,27 @@ def _failure_summary(gen: Dict[str, Any], rev: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def _review_audit(rev: Dict[str, Any]) -> Dict[str, Any]:
+    """Structured audit trail for one review iteration: parser demotions,
+    truncated evidence base, and high-severity findings whose locations could
+    not be grounded. This is the raw material for fp/fn attribution — without
+    it the log only says WHAT the verdict was, not how trustworthy it is."""
+    audit: Dict[str, Any] = {
+        "parse_error": bool(rev.get("parse_error")),
+        "truncated_repair": bool(rev.get("truncated_repair")),
+    }
+    if rev.get("exploration_truncated"):
+        audit["exploration_truncated"] = True
+    unver = (rev.get("summary") or {}).get("unverified_high_severity")
+    if unver:
+        audit["unverified_high_severity"] = unver
+    return audit
+
+
+def _verify_audit(rr: Dict[str, Any]) -> Dict[str, Any]:
+    return {"evidence_level": rr.get("evidence_level", "not_run")}
+
+
 @dataclass
 class LoopIteration:
     iteration: int
@@ -71,6 +92,9 @@ class LoopIteration:
     notes: Optional[str] = None
     # review 阶段的完整报告（findings/score 等）；聚合值之外的明细不再丢失。
     review_payload: Optional[Dict[str, Any]] = None
+    # 审计增量（CAAPF-lite）：review 迭代带 parser 降级/证据截断/未核实高危
+    # finding，verify 迭代带 evidence_level——失败可归因性的最小原料。
+    audit: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -85,6 +109,10 @@ class LoopResult:
     strategy: str = "review_guided"
     elapsed_seconds: float = 0.0
     message: str = ""
+    # 最终 verdict 所依据的执行证据等级：
+    # "tests_passed" | "tests_failed" | "patch_applied_only" | "patch_failed" | "not_run"
+    # patch_applied_only 是弱证据放行（no-tests weak-pass），不得与 tests_passed 同权解读。
+    verification_status: str = "not_run"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -229,6 +257,7 @@ class LoopSubAgent:
                                       "(truncated_repair/parse_error); "
                                       "approve withheld") if rev_unreliable else None)
             it.review_payload = rev
+            it.audit = _review_audit(rev)
             iterations.append(it)
             self._accum_tokens(token_total, rev.get("token_usage"))
 
@@ -246,6 +275,7 @@ class LoopSubAgent:
                     resolve_rate=0.0,
                     token_usage_total=token_total,
                     strategy="review_guided",
+                    verification_status="not_run",
                     message="review output unparseable; no actionable feedback — loop stopped",
                 )
 
@@ -257,10 +287,24 @@ class LoopSubAgent:
                 rr = await self._verify(current_pr, repo_path,
                                         test_info=test_info, test_runner=test_runner)
                 verification_failed = rr is not None and not rr["passed"]
+                weak_evidence = (rr is not None
+                                 and rr["evidence_level"] == "patch_applied_only")
                 if rr:
-                    iterations.append(self._mk_iter(i, "verify",
-                                                    "verification_failed" if verification_failed else "approve",
-                                                    rr["confidence"], 0, notes=rr["details"]))
+                    vit = self._mk_iter(i, "verify",
+                                        "verification_failed" if verification_failed else "approve",
+                                        rr["confidence"], 0, notes=rr["details"])
+                    vit.audit = _verify_audit(rr)
+                    iterations.append(vit)
+                if weak_evidence:
+                    # Weak-pass stays allowed by design (ad-hoc reviews often
+                    # have no test suite), but the approve must not carry the
+                    # same weight as a tests-backed one: cap the recorded
+                    # confidence and say so in the message.
+                    if it.confidence > 0.6:
+                        it.confidence = 0.6
+                    it.notes = ((it.notes + "; ") if it.notes else "") + \
+                        "confidence capped: approval rests on patch-application " \
+                        "evidence only (no tests were run)"
                 return LoopResult(
                     success=not verification_failed,
                     final_decision="verification_failed" if verification_failed else rev.get("decision", "approve"),
@@ -270,8 +314,13 @@ class LoopSubAgent:
                     resolve_rate=rr["resolve_rate"] if rr else 0.0,
                     token_usage_total=token_total,
                     strategy="review_guided",
+                    verification_status=rr["evidence_level"] if rr else "not_run",
                     message=(f"verification failed at iteration {i}: {rr['details']}"
-                             if verification_failed else f"approved at iteration {i}"),
+                             if verification_failed
+                             else f"approved at iteration {i}"
+                                  + (f" (confidence capped at {it.confidence}; evidence: patch"
+                                     " application only — no tests were run)"
+                                     if weak_evidence else "")),
                 )
 
             # 2) reach max, 提前 stop
@@ -306,9 +355,11 @@ class LoopSubAgent:
         rr = await self._verify(current_pr, repo_path,
                                 test_info=test_info, test_runner=test_runner)
         if rr:
-            iterations.append(self._mk_iter(len(iterations) + 1, "verify",
-                                            "verification_failed" if not rr["passed"] else "approve",
-                                            rr["confidence"], 0, notes=rr["details"]))
+            vit = self._mk_iter(len(iterations) + 1, "verify",
+                                "verification_failed" if not rr["passed"] else "approve",
+                                rr["confidence"], 0, notes=rr["details"])
+            vit.audit = _verify_audit(rr)
+            iterations.append(vit)
 
         return LoopResult(
             success=False,
@@ -319,6 +370,7 @@ class LoopSubAgent:
             resolve_rate=rr["resolve_rate"] if rr else 0.0,
             token_usage_total=token_total,
             strategy="review_guided",
+            verification_status=rr["evidence_level"] if rr else "not_run",
             message=stop_reason,
         )
 
@@ -427,6 +479,7 @@ class LoopSubAgent:
                     notes=("untrusted review output; "
                            "approve withheld") if rev_unreliable else None)
                 it.review_payload = rev
+                it.audit = _review_audit(rev)
                 iterations.append(it)
                 self._accum_tokens(token_total, rev.get("token_usage"))
                 approved = (not rev_unreliable
@@ -444,16 +497,20 @@ class LoopSubAgent:
 
         # ---- Adjudication: evidence-first ----
         resolve_rate = 0.0
+        verification_status = "not_run"
         approved = sorted((c for c in candidates if c["approved"]),
                           key=lambda c: -c["confidence"])
         for c in approved:
             rr = await self._verify(c["pr"], repo_path,
                                     test_info=test_info, test_runner=test_runner)
             if rr:
-                iterations.append(self._mk_iter(
+                verification_status = rr["evidence_level"]
+                vit = self._mk_iter(
                     len(iterations) + 1, "verify",
                     "verification_failed" if not rr["passed"] else "approve",
-                    rr["confidence"], 0, notes=rr["details"]))
+                    rr["confidence"], 0, notes=rr["details"])
+                vit.audit = _verify_audit(rr)
+                iterations.append(vit)
                 resolve_rate = max(resolve_rate, rr["resolve_rate"])
             if rr and rr["passed"]:
                 return LoopResult(
@@ -462,6 +519,7 @@ class LoopSubAgent:
                     total_iterations=len(iterations), iterations=iterations,
                     resolve_rate=resolve_rate, token_usage_total=token_total,
                     strategy="best_of_n",
+                    verification_status=verification_status,
                     message=f"candidate {c['idx']}/{len(candidates)} approved+verified",
                 )
 
@@ -477,10 +535,13 @@ class LoopSubAgent:
             rr = await self._verify(c["pr"], repo_path,
                                     test_info=test_info, test_runner=test_runner)
             if rr:
-                iterations.append(self._mk_iter(
+                verification_status = rr["evidence_level"]
+                vit = self._mk_iter(
                     len(iterations) + 1, "verify",
                     "verification_failed" if not rr["passed"] else "approve",
-                    rr["confidence"], 0, notes=rr["details"]))
+                    rr["confidence"], 0, notes=rr["details"])
+                vit.audit = _verify_audit(rr)
+                iterations.append(vit)
                 resolve_rate = max(resolve_rate, rr["resolve_rate"])
             if rr and rr["passed"]:
                 return LoopResult(
@@ -489,6 +550,7 @@ class LoopSubAgent:
                     total_iterations=len(iterations), iterations=iterations,
                     resolve_rate=resolve_rate, token_usage_total=token_total,
                     strategy="best_of_n",
+                    verification_status=verification_status,
                     message=(f"candidate {c['idx']} verify-passed but "
                              "review-rejected; returning as evidence-ranked best"),
                 )
@@ -498,6 +560,7 @@ class LoopSubAgent:
             final_pr_diff=best_diff, total_iterations=len(iterations),
             iterations=iterations, resolve_rate=resolve_rate,
             token_usage_total=token_total, strategy="best_of_n",
+            verification_status=verification_status,
             message=f"no candidate approved+verified in {len(candidates)}",
         )
 
@@ -659,10 +722,24 @@ class LoopSubAgent:
         passed = d.get("passed", False) or (
             d.get("patch_applied", False) and status in (None, "unknown", "")
         )
+        # Evidence level makes the weak-pass downgrade VISIBLE: an approve that
+        # rests on "the patch applied" must never read the same as one that
+        # rests on "the tests passed" (Euler: compliance-pass ≠ semantic-pass).
+        if status in ("resolved", "partially_resolved"):
+            evidence_level = "tests_passed" if passed else "tests_failed"
+        elif status == "not_resolved":
+            evidence_level = "tests_failed"
+        elif passed:
+            evidence_level = "patch_applied_only"
+        elif d.get("patch_applied") is False:
+            evidence_level = "patch_failed"
+        else:
+            evidence_level = "tests_failed"
         return {
             "passed": passed,
             "confidence": d.get("confidence", 0.0) or (0.5 if passed else 0.0),
             "details": d.get("details", ""),
+            "evidence_level": evidence_level,
             "resolve_rate": 1.0 if status == "resolved" else
                            (0.5 if status == "partially_resolved" else 0.0),
         }

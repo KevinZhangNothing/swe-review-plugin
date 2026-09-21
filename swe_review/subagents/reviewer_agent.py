@@ -224,6 +224,10 @@ class ReviewReport:
     timestamp: str = ""
     token_usage: Optional[Dict[str, int]] = None
     exploration_steps: int = 0
+    # Set when the explorer hit MAX_RELATED_FILES / max_file_bytes and the
+    # reviewer saw a truncated evidence base — loop logs use it as the
+    # zero-cost proxy for evidence_missing failures.
+    exploration_truncated: bool = False
     prompt_style: str = "engineering"  # "engineering" | "concise" | "detailed"
 
     def __post_init__(self):
@@ -284,6 +288,7 @@ class ReviewReport:
             "timestamp": self.timestamp,
             "token_usage": self.token_usage,
             "exploration_steps": self.exploration_steps,
+            "exploration_truncated": self.exploration_truncated,
             "prompt_style": self.prompt_style,
         }
 
@@ -713,6 +718,7 @@ class ReviewerSubAgent:
             report.raw_response = response
 
         report.exploration_steps = exploration_steps
+        report.exploration_truncated = bool(repo_context.get("truncated"))
         return report
 
     async def _review_once(

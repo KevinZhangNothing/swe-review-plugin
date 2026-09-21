@@ -21,7 +21,7 @@ from .subagents.analyzer_agent import AnalyzerSubAgent, AnalyzerResult
 from .subagents.generator_agent import GeneratorSubAgent, GeneratedPR
 from .subagents.loop_agent import LoopSubAgent, LoopResult
 # stdlib-only module, so a top-level import carries no cycle risk
-from .subagents.location_grounding import ground_report_locations
+from .subagents.location_grounding import ground_report_locations, unverified_high_severity
 from .subagents.diff_sharding import (
     DEFAULT_SHARD_BUDGET_CHARS,
     DEFAULT_SHARD_CONCURRENCY,
@@ -157,6 +157,14 @@ class ReviewSkill:
         # Deterministic grounding: verify/relocate finding locations against
         # the real workspace before serialization (no LLM cost).
         ground_report_locations(report, repo_path=repo_path)
+        # Consume the grounding marks: unverifiable P0/P1 claims must be visible
+        # to a human, not silently weighted the same as verified ones.
+        unver = unverified_high_severity(report)
+        if unver:
+            report.summary["unverified_high_severity"] = (
+                "以下高严重度 finding 的路径/行号未能在仓库中核实（可能已过期或"
+                "不在本仓库），请人工确认: " + "; ".join(unver)
+            )
         return SkillResult(
             ok=(report.decision in DECISION_CHOICES and not report.parse_error),
             payload=report.to_dict(deep=deep),

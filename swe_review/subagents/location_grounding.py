@@ -157,6 +157,42 @@ def ground_report_locations(report, repo_path=None) -> None:
             entry.location = _ground_flat(entry.location, repo, index)
 
 
+def _location_unverified(location: Any) -> bool:
+    """True when grounding (or the missing-location path) marked this location
+    as not confirmable against the workspace. Best-effort: flat locations that
+    never entered grounding (no ``:line`` suffix) carry no marker and are not
+    counted."""
+    if isinstance(location, dict):
+        return location.get("verified") is False or location.get("line_verified") is False
+    if isinstance(location, str):
+        return "[unverified]" in location or "line-unverified" in location
+    return False
+
+
+def unverified_high_severity(report) -> List[str]:
+    """Collect high-severity findings/defects whose locations failed grounding.
+
+    Grounding annotates rather than drops (by design — a stale path can still
+    point at a real problem), so without this consumer the verified/unverified
+    metadata was invisible downstream. Callers surface the returned entries so
+    a human can re-check the small set of unverifiable-but-serious claims
+    instead of trusting or rejecting them wholesale.
+
+    Returns entries like "P0 <title> @ <location>".
+    """
+    out: List[str] = []
+    for f in getattr(report, "findings", []) or []:
+        if getattr(f, "severity", "") in ("P0", "P1") and _location_unverified(f.location):
+            loc = f.location.get("path", "?") if isinstance(f.location, dict) else f.location
+            out.append(f"{f.severity} {getattr(f, 'title', '')} @ {loc}")
+    for d in getattr(report, "defects", []) or []:
+        if getattr(d, "severity", "") == "high" and _location_unverified(d.location):
+            loc = d.location.get("path", "?") if isinstance(d.location, dict) else d.location
+            desc = (getattr(d, "description", "") or "")[:60]
+            out.append(f"high {desc} @ {loc}")
+    return out
+
+
 def _safe_repo(repo_path) -> Optional[Path]:
     p = Path(repo_path)
     return p if p.is_dir() else None
