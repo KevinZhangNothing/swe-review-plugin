@@ -131,7 +131,8 @@ async def _cmd_revise(args) -> None:
     from . import ReviseSkill
     tool = _adapter_from_args(args)
     skill = ReviseSkill(tool_adapter=tool, prompt_style=args.prompt_style,
-                          feedback_level=args.feedback_level)
+                          feedback_level=args.feedback_level,
+                          max_regen_attempts=args.max_regen_attempts)
     report = json.loads(_read(args.review_report))
     res = await skill.execute(
         issue=args.issue,
@@ -155,7 +156,8 @@ async def _cmd_loop(args) -> None:
                          shard_budget_chars=args.shard_budget,
                          shard_concurrency=args.shard_concurrency)
     revise = ReviseSkill(tool_adapter=tool, prompt_style=args.prompt_style,
-                          feedback_level=args.feedback_level)
+                          feedback_level=args.feedback_level,
+                          max_regen_attempts=args.max_regen_attempts)
     generate = GenerateSkill(tool_adapter=tool)
     verify = VerifySkill(repo_path=args.repo_path, config=_build_check_config(args))
     loop = LoopSkill(
@@ -385,6 +387,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_rvs.add_argument("--feedback-level", default="full_feedback",
                        choices=["full_feedback", "minimal_feedback", "baseline"],
                        help="How much feedback the reviser is given.")
+    p_rvs.add_argument("--max-regen-attempts",
+                       type=lambda v: _positive_int(v, 1, 5), default=2,
+                       help="reviser regen budget on unparseable/empty output; "
+                            "each attempt is a full-price LLM call, 1 = fastest")
     p_rvs.set_defaults(handler=_cmd_revise)
 
     p_loop = sub.add_parser("loop", help="Generate-Review-Revise-Verify loop")
@@ -404,6 +410,10 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["engineering", "concise", "detailed"])
     p_loop.add_argument("--feedback-level", default="full_feedback",
                         choices=["full_feedback", "minimal_feedback", "baseline"])
+    p_loop.add_argument("--max-regen-attempts",
+                        type=lambda v: _positive_int(v, 1, 5), default=2,
+                        help="reviser regen budget on unparseable/empty output; "
+                             "each attempt is a full-price LLM call, 1 = fastest")
     p_loop.add_argument("--initial-pr-diff", default=None,
                         help="path or '-' to an existing candidate diff; "
                              "when given, the loop reviews/revises it instead of "

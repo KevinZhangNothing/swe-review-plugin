@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .reviewer_agent import DECISION_APPROVING
+from ..tools.decisions import choose_revision_action, findings_digest
 
 
 def _unwrap_skill(out: Any) -> Dict[str, Any]:
@@ -44,14 +45,7 @@ def _failure_summary(gen: Dict[str, Any], rev: Dict[str, Any]) -> Dict[str, Any]
     + top findings is enough to steer the next candidate away from a dead end
     without blowing up the prompt.
     """
-    findings = rev.get("findings") or rev.get("defects") or []
-    tops: List[str] = []
-    for f in findings[:3]:
-        if isinstance(f, dict):
-            sev = f.get("severity", "")
-            title = f.get("title") or f.get("description", "")
-            if title:
-                tops.append(f"{sev}:{title}"[:160])
+    tops: List[str] = findings_digest(rev, limit=3)
     return {
         "approach": (gen.get("rationale") or "")[:300],
         "review_decision": rev.get("decision", ""),
@@ -83,7 +77,7 @@ def _verify_audit(rr: Dict[str, Any]) -> Dict[str, Any]:
 @dataclass
 class LoopIteration:
     iteration: int
-    phase: str  # "generate" | "review" | "revise" | "verify"
+    phase: str  # "generate" | "review" | "revise" | "regenerate" | "verify"
     decision: str
     confidence: float
     defects_count: int
@@ -327,6 +321,30 @@ class LoopSubAgent:
             if self.early_stop and i >= max_iter:
                 stop_reason = f"max iterations reached ({max_iter})"
                 break
+
+            # 2.5) 本地决策层(可选):laya 判定 revise 还是 regenerate。
+            # 未安装 laya_mlx / 模型缺失 / 推理失败时返回 None → 维持原有
+            # 「总是 revise」行为,无本地模型的环境零行为变化。
+            action = choose_revision_action(rev)
+            if action == "regenerate" and self.generator_skill:
+                gen = await self._generate(
+                    issue, repo_path,
+                    prior_failures=[_failure_summary(current_pr, rev)])
+                if gen.get("diff"):
+                    iterations.append(self._mk_iter(
+                        i, "regenerate", "ok", gen.get("confidence", 0.5),
+                        len(rev.get("defects", [])),
+                        notes=f"laya chose regenerate; {gen.get('rationale', '')}"))
+                    current_pr = {"title": gen.get("title", ""),
+                                  "body": gen.get("body", ""),
+                                  "diff": gen.get("diff", "")}
+                    continue
+                iterations.append(self._mk_iter(
+                    i, "regenerate", "failed", 0.0, 0,
+                    notes="laya chose regenerate but generator returned an "
+                          "empty diff; falling back to revise"))
+                # 有意不 continue：同一轮内回落 revise。若 continue，下一轮会
+                # 对已知被拒的 diff 再烧一次 review 调用，更贵。
 
             # 3) revise
             if not self.revise_skill:

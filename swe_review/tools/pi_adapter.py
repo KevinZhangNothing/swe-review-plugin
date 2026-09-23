@@ -1,5 +1,8 @@
 """
-PiAdapter - 通过 pi CLI 走 `pi --mode print -p` headless（subprocess 即可）
+PiAdapter - 通过 pi CLI 走 `pi --mode text -p` headless（subprocess 即可）
+
+注：pi >= 0.87 把输出模式与运行模式拆开 —— `--mode` 只接受 text/json/rpc，
+非交互退出由 `-p/--print` 表达；旧的 `--mode print` 会被直接拒绝。
 
 参考:
 - /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/docs/skills.md
@@ -129,7 +132,7 @@ class PiAdapter:
         # 大 prompt 下稳定输出 <tool_call>（如 ctx_reduce）而非回答正文，
         # 导致 review 输出空响应。全部关掉后模型不再看到任何工具定义。
         argv = [
-            self.cli_path, "--mode", "print", "--no-tools",
+            self.cli_path, "--mode", "text", "--no-tools",
             "--no-extensions", "--no-skills", "--no-context-files",
             "--no-prompt-templates", "--no-themes",
             "--system-prompt", system,
@@ -153,7 +156,7 @@ class PiAdapter:
         if rc != 0:
             err_tail = (err or text_clean)[-500:]
             raise RuntimeError(
-                f"pi --mode print failed (rc={rc}). stderr_tail={err_tail!r}"
+                f"pi --mode text failed (rc={rc}). stderr_tail={err_tail!r}"
             )
         text = strip_fences(text_clean)
         tok = extract_tokens_from_text(text, f"{system}\n{user}")
@@ -174,7 +177,7 @@ class PiAdapter:
             "tool": self.name,
             "cli_present": bool(shutil.which(self.cli_path)),
             "skills_dir": str(self.skills_dir),
-            "command_template": f"{self.cli_path} --mode print -p <prompt>",
+            "command_template": f"{self.cli_path} --mode text -p <prompt>",
             "hint": (
                 "Pi reads API keys from `~/.pi/agent/auth.json`. The installed "
                 "swe-review skills are auto-copied to "

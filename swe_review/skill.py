@@ -189,7 +189,8 @@ class ReviseSkill:
     name = "revise"
 
     def __init__(self, tool_adapter=None, prompt_style: str = "concise",
-                 feedback_level: str = "full_feedback"):
+                 feedback_level: str = "full_feedback",
+                 max_regen_attempts: int = 2):
         from .tools.base import BaseAdapter
         self.tool = tool_adapter or BaseAdapter()
         self.prompt_style = prompt_style
@@ -198,6 +199,7 @@ class ReviseSkill:
             tool_adapter=self.tool,
             prompt_style=prompt_style,
             feedback_level=feedback_level,
+            max_regen_attempts=max_regen_attempts,
         )
 
     async def execute(
