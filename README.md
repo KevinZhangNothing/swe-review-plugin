@@ -274,6 +274,8 @@ classDiagram
         +float resolve_rate
         +Dict token_usage_total
         +str strategy
+        +str executed_strategy
+        +str verification_status
         +float elapsed_seconds
         +str message
     }
@@ -302,6 +304,9 @@ classDiagram
         +str timestamp
         +Dict token_usage
         +int exploration_steps
+        +bool exploration_truncated
+        +str exploration_degraded
+        +str tool_name
         +str prompt_style
     }
 
@@ -391,6 +396,7 @@ swe-review review \
 swe-review loop \
     --issue "Bug" \
     --repo-path /path/to/repo \
+    --tool pi \
     --strategy hybrid \
     --max-iterations 5
 
@@ -578,27 +584,62 @@ swe-review list-tools                                  # 列出 adapter 健康�
 swe-review health                                      # 每个 adapter 发一次 trivial prompt
 swe-review install-skills [--source ...] [--pi-skills-dir ...]
 
-swe-review review    --issue ... --pr-diff ... \
-                     [--tool pi] [--prompt-style engineering|concise|detailed] [--deep] \
+swe-review review    --issue ... --pr-diff ... [--tool {auto|claude-code|cursor|opencode|pi|host|shell}] \
+                     [--prompt-style engineering|concise|detailed] [--deep] \
                      [--timeout 1200] [--no-shard] [--shard-budget 400000] \
                      [--shard-concurrency 4]
 
-swe-review revise    --issue ... --pr-diff ... \
+swe-review revise    --issue ... --pr-diff ... [--tool ...] \
                      --review-report ... [--feedback-level full_feedback] [--timeout 1200]
 
-swe-review loop      --issue ... --repo-path . \
+swe-review loop      --issue ... --repo-path . [--tool ...] \
                      [--strategy hybrid] [--max-iterations 5] [--n-best-of 3] [--timeout 600] \
-                     [--no-shard] [--shard-budget 400000] [--shard-concurrency 4]
+                     [--sandbox|--no-sandbox] [--no-shard] [--shard-budget 400000] \
+                     [--shard-concurrency 4]
 
 swe-review verify    --pr-diff ... \
-                     [--repo-path .] [--sandbox] [--test-info ...] [--oracle ...] \
+                     [--repo-path .] [--sandbox|--no-sandbox] [--test-info ...] [--oracle ...] \
                      [--test-runner "python -m pytest {test} -q"]
 ```
+
+`--tool` 默认 **`auto`**：按 `claude-code → cursor → opencode → pi` 的顺序，选第一个
+在 `$PATH` 上真实可解析的 CLI。探测只查二进制可用性、不发网络请求、不打试探 prompt，
+因此开销恒定；装好但配置错的 CLI 会在真正调用时报出自己的错误，比"找不到工具"更有
+指导性。
+
+`auto` **绝不会**落到 `shell` 或 `host`：前者不调用任何 LLM，后者需要外部 agent 回答
+落盘 prompt，自动选中都会悄悄改变"审查"的含义。若本机一个 CLI 都没有，命令以退出码
+2 失败并列出查找过的二进制名——不再回退到占位实现。
+
+> 此前默认值是 `shell`——它恒返回固定 `request_changes` 载荷，于是
+> `swe-review review` 会打印一份结构完整、带评分、措辞确信却零分析的报告并以退出码 0
+> 收尾。这是"AI 自审 PR"最危险的失败模式，`auto` 取代它是为了保持省略 `--tool` 仍可
+> 用，同时确保调用的一定是真实后端。
+
+若报告确实来自 `shell` 或探索降级，payload 顶层会带 `degraded: [...]` 字段（见下文
+"证据可信度"），调用方无需解析散文即可判断。
+
+#### 可观测行为变更（v1.0.0 → 本次修复）
+
+以下都是**对外可见的语义变更**，如果你的脚本读取这些字段请对照迁移：
+
+| 字段 | 变更前 | 变更后 | 影响与迁移 |
+|---|---|---|---|
+| `--tool` 默认值 | `shell`（不调用 LLM） | `auto`（自动探测真实 CLI） | 省略 `--tool` 的调用**不再**走占位实现。若你的 CI 依赖旧的占位行为做冒烟测试，显式写 `--tool shell` |
+| `--tool` 无可用 CLI 时 | 静默回落 `shell`，退出码 0 | 退出码 2 + stderr 提示 | 依赖"总是成功"的脚本需要处理退出码 2，或显式指定 `--tool` |
+| `ShellTools.get_status()["configured"]` | `true` | `false` | 这是**有意的契约收紧**：`configured` 回答的是"是否接入了真实 LLM"，占位实现没有。按 `configured` 过滤"可用后端"的脚本现在会正确排除 `shell`。若你只想识别占位实现而不想改变可用性判断，改用新增的 `is_placeholder: true`。仓内没有任何代码消费此字段（改动前已用 grep 核实），因此对本项目自身无影响；该声明针对的是外部脚本 |
+| `ShellTools.get_status()["is_placeholder"]` | 不存在 | 新增 `true` | 纯新增，无破坏 |
+| `LoopResult.executed_strategy` | 不存在 | 新增；`strategy` 改为只记用户**请求**的策略 | 纯新增字段。注意 `strategy` 语义收紧了：`best_of_n` 在显式 `initial_pr` 下会委托 `review_guided`，此前 `strategy` 被覆写成 `best_of_n` 掩盖了这一点。判断"真实跑了哪条编排路径"请读 `executed_strategy` |
+| `payload.degraded` | 只有 review 带 | review、revise **和** generate 都带 | 纯新增字段（`verify` 刻意不带，见不变式矩阵） |
+| `install-skills` 空源 | 输出 `{"installed": {}}`，退出码 0 | 退出码 1 + stderr 提示 | 依赖退出码 0 判断成功的脚本现在能正确发现路径配错 |
+
+`--tool shell` 仍可显式指定，用于 CI 里跑通数据流的冒烟测试。
 
 完整参数见 `swe-review -h`。`--timeout` 省略时各 adapter 保留自己的默认值
 （claude-code/opencode 1800s，pi/cursor 600s）；engineering 审查一份大 diff 常需
 6–9 分钟，用 pi 时建议显式给 `--timeout 1200` 以上。`verify` 不需要 `--tool`
-（它不调 LLM）。
+（它不调 LLM）。`--no-sandbox` 在 `verify` 与 `loop` 上都可用——iOS 增量编译需要
+复用 `Pods/`、`DerivedData` 时就靠它。
 
 ### 大 diff 自动分片（map-reduce 审查）
 
@@ -863,6 +904,23 @@ flowchart LR
 | 分片的输出契约必须是 findings-only | `engineering_prompt._shard_task_section()` | 分片只产 `decision`/`findings`/`hard_gate`；评分与 summary 由 synthesis 决定。要求分片产出完整报告会让每片的 completion 接近整轮量级，吃掉并行的全部收益 |
 | adapter 不得阻塞事件循环 | 四个 CLI adapter 用 `await asyncio.to_thread(run_subprocess / run_in_pty, …)` | `run_subprocess`/`run_in_pty` 是同步函数；直接调用会让事件循环被阻塞整个子进程生命周期，使项目里**每一处 `asyncio.gather`**（best_of_n 候选波、大 diff 分片、health 探针）表面并发、实际串行。`tests/test_adapters.py::test_cli_adapter_chat_does_not_block_the_event_loop` 强制这一点 |
 | 模型产出的 diff 必须过结构校验才准离开 producer | `diff_validation.validate_unified_diff()`，在 `ReviserSubAgent._parse_response` / `GeneratorSubAgent._parse` 中调用 | hunk 算术不对（`@@ -a,b +c,d @@` 与正文行数不符）的 diff，review 会**读文本并批准**它，直到 verify 才以 `corrupt patch` 拒绝——此时已烧掉两轮 review 且没有重试机会。校验器在**产出点**拦下并触发 regen 重试；不通过则交付空 diff，让闭环以诚实的 `revise produced no usable diff` 停止。注意它**必要但不充分**（只查算术，完整可应用性仍需仓库上下文，由验证器裁定） |
+| `HostTurnRequired` 绝不被错误隔离吞掉 | `loop_agent._raise_protocol_signals()`，在 `best_of_n` 的 generate/review 两处 `gather(return_exceptions=True)` 之后立即调用 | 它是**控制信号**而非失败：`--tool host` 下表示磁盘上有 prompt 待答。被 `return_exceptions` 转成空候选后，`best_of_n` 会打印 "no candidate approved+verified" 并以退出码 0 收尾，而 rendezvous 目录里留着无人回答的 prompt，调用方永远也学不到下一步该做什么。`review_guided` 一直是对的，只有并发波路径有这个问题 |
+| 显式 `initial_pr` 在任何策略下都不得被丢弃 | `_run_review_guided` / `_run_best_of_n` / `_run_hybrid` 三处入口都先判 `initial_pr.get("diff")` | `--initial-pr-diff` 的契约是"审查/修订**这一个**候选"。`best_of_n` 曾经不接受该参数，用户给的 patch 被静默丢弃并改为自行生成；现在跳过生成并记录一条 `generate/skipped` 迭代，使"为什么没有候选被生成"可从 `LoopResult` 直接回答 |
+| `--tool` 不得解析到离线占位实现 | `cli._add_tool_arg(default="auto")` → `tools.resolve_adapter_name()`；`AUTO_DETECT_ORDER` 只含四个真实 CLI | 默认值曾是 `shell`：不调用任何 LLM，恒返回固定 `request_changes` 载荷。`review` 不带 `--tool` 会打印一份结构完整、带评分、措辞确信却零分析的报告并以退出码 0 收尾——对"AI 自审 PR"是最危险的失败模式。`auto` 保持"省略该 flag 仍可用"的体验，但只在 `$PATH` 上解析到真实 CLI 时才放行；一个都没装则退出码 2 并列出查找过的二进制名，绝不回落 `shell`。`auto`/`host` 互不越界：`host` 需外部 agent 回答落盘 prompt，也不会被自动选中 |
+| 一切调 LLM 的结果都必须显式标注证据降级 | `skill._with_degraded()` / `_degraded_reasons()`，review / revise / generate 共用；输入为 adapter 名 + `exploration_degraded` / `truncated_repair` / `parse_error` | 这些路径都能产出"结构完整但证据为零"的结果。`payload.degraded[]` 让下游（人、CI、上层 agent）不必解析 `summary` 散文即可判断可信度——与 verify 侧 `evidence_level` 同一思路。**三个调模型的 skill 共用同一判定**，否则同一个 `--tool shell` 会在一个命令里被标注、在另一个里装成正常结果：`generate` 尤其需要，因为 `shell` 的固定载荷没有 `diff` 键，解析后得到空 diff——`ok=False` 说明「没产物」，但说不清「为什么没产物」。verify 刻意不标注：它应用补丁并跑命令、不调 LLM，`shell` 对它无影响，标注只会是假阳性；verify 自己的证据契约是 `resolution_status`（弱通过 `patch_applied_only` 由 `LoopResult.verification_status` 透出） |
+| `auto` 探测必须与真实执行路径一致 | `tools.detect_adapter()` 只对 adapter **自己解析出的 `cli_path`** 做一次 `shutil.which` | 早先版本用"解析路径 OR 硬编码二进制名"双判据，与 adapter 的真实可执行性存在缝隙：opencode 在有默认安装目录时解析到该目录、否则解析到 `$PATH` 上的名字。接受"任一即可"会选出一次运行时才报错的后端——一个探测结果，一个可执行性问题，不能有两个答案 |
+| `auto` 失败必须按**类型**而非消息文本分流 | `tools.ToolNotFound(LookupError)`；`cli.main` 用 `except ToolNotFound` 返回退出码 2 | 早先写法是 `except ValueError` + `if "no LLM CLI found" not in str(exc): raise`——把错误文案变成了控制流，消息一改写就退回裸 traceback；同时其它 `ValueError` 被静默重抛，维护时极易踩坑 |
+| 探索降级必须可归因 | `ReviewerSubAgent._explore()` 拆分为 `except asyncio.TimeoutError` 与 `except Exception` 两支，分别写入 `explore_timeout` / `explore_error: …`；异常体经 `_safe_exc_summary()` 截断至 200 字符 | 原写法 `except (asyncio.TimeoutError, Exception)` 等价于 `except Exception`（TimeoutError 本就是 Exception 子类），使真实超时和代码 bug 无法区分，两类降级都以同一副"静态 fallback"面貌出现。降级原因会进入 CLI JSON、再被贴进 issue 和 CI 日志，所以异常消息截断而非原样转发——内部消息可能带绝对路径或配置片段，排障真正需要的是异常类型名 |
+| best_of_n 的共享探索必须复用而非重跑 | `ReviewSkill.execute(repo_context=…)` → `ReviewerSubAgent` 跳过 `_explore`；`_tag_shared_exploration()` 在传给 reviewer 时标注空证据 | 每个候选面向**同一** repo + 同一 issue，逐候选重跑 explorer 是纯冗余（实测 N=3 → 3 次完整探索）。探索结果只读、不含候选特定证据，可安全复用。**但复用会绕过逐候选的降级标注**：共享探索返回 `{}`/`None` 时，每个候选都拿到裸空 dict，报告看起来有仓库依据实则零证据——所以标注发生在交给 reviewer 的那一步（generator 仍收到原始 payload，见 `test_best_of_n_wave1_parallel_perspectives_and_shared_exploration`） |
+| `token_usage_total` 必须覆盖 generate 与 revise | `GeneratedPR.token_usage` / `RevisedPR.token_usage` + `_accum_tokens` | 此前只累加 review 用量，而这两类恰是输出 token 最多的调用（N 个候选生成 + 每轮修订），成本报告结构性漏掉大头 |
+| `install-skills` 不得静默安装 0 个 | `cli._cmd_install_skills()` 在 `installed` 为空时退出码 1 | 默认 `--source` 曾是不存在的 `skills_md/`，命令输出 `{"installed": {}}` 却返回 0 |
+| `install-skills` 的源必须与 CWD 无关 | `--source` 默认 `None`，由 `PiAdapter` 解析（包内 `.claude_skills/` 优先，再回退仓库 `.claude/skills/`） | 曾经的默认值是**相对路径**，只有在仓库根目录运行才能找到源；从任何其它目录调用都会失败。现在解析结果恒为绝对路径，`test_install_skills_default_source_resolves_from_the_package` 通过 `chdir("/")` 复跑同一断言来锁定 |
+| skill 源必须随包分发 | `scripts/sync_skill_sources.py` 把 `.claude/skills/*/SKILL.md` 镜像到 `swe_review/.claude_skills/`；`pyproject.toml` 的 `package-data` 声明 `.claude_skills/*/SKILL.md` | wheel 只带声明的 package data，而 `.claude/skills/` 在包**外**。此前 `pip install` 后包内一个 skill 源都没有，回退路径指向 `<site-packages>/.claude/skills`（setuptools 从不创建）。已在干净 venv 里用真实 wheel 验证：安装后 `install-skills` 装出 7 个。**不用 `data-files`**——实测它把文件放进 `<name>.data/data/`，安装后落在 `sys.prefix` 而非可导入的包内 |
+| `py.typed` 声明与文件必须同时存在 | `swe_review/py.typed`（空 marker，PEP 561）+ `package-data` 声明 | `pyproject.toml` 一直声明 `py.typed` 但文件不存在；已构建 wheel 验证它现在确实被打包。挂在没有类型检查的包上的 marker 会误导下游 |
+| adapter 的 CLI 发现不得有永不求值的回退分支 | `opencode_adapter._find_cli()` 先判 `Path(...).is_file()` 再回退 `shutil.which()` | 原写法把 `os.path.expanduser("~/.opencode/bin/opencode")` 直接放在 `or` 链里：`expanduser()` **永远**返回非空字符串，于是它是无条件真值，`shutil.which("opencode")` 成为死代码。结果是用 Homebrew / `npm -g` 装在 `$PATH` 上的 opencode 永远发现不了，adapter 自我报告为未配置——而这会让 `--tool auto` 跳过一台本来可用的后端 |
+| 请求策略与实际执行策略必须分开记录 | `LoopResult.strategy`（用户请求）vs `LoopResult.executed_strategy`（真实运行路径） | `best_of_n`/`hybrid` 在显式 `initial_pr` 下会合法地委托给 `review_guided`（没有候选可生成）。此前代码直接覆写 `rg.strategy`，导致 `strategy` 字段不再等于真实编排路径——一个从未生成过候选的运行会自称 "best_of_n"，调试时误导。**归属单一**：`strategy` 只由 `execute()` 写，`executed_strategy` 只由各 `_run_*` 编排器写（只有它们知道发生了委托），`execute()` 仅在字段为空时兜底，绝不猜 |
+| token 累计只有一份实现，且契约有测试锁定 | `tools.base.accum_usage()`，由 reviewer / reviser / loop 三处复用；`tests/test_tools_base.py` | 此前有三份近乎重复的累计逻辑（`loop._accum_tokens`、`reviser._accum_usage`、`reviewer._merge_token_usage`），对非数值的处理已经漂移：一份会抛 `TypeError`，另两份会静默存入非法值。CLI 返回的 usage 是不可信 JSON，必须统一忽略非数值。契约的三条（拒 bool、忽略非数值、浮点四舍五入而非截断）各有用例——`bool` 是 `int` 子类，漏掉守卫会让 `{"cached": true}` 给 token 总数 +1 |
+| 探测结果在进程内记忆化 | `tools._resolved_cli_paths()` 缓存于 `_CLI_PATHS_CACHE`；`_reset_detection_cache()` 可清除 | adapter 解析路径时会读文件系统（`ClaudeCodeAdapter` 读 `~/.claude/settings.json`），而 `resolve_adapter_name` 一次调用曾构造全部 adapter 两遍（`detect_adapter` 一次、拼错误提示一次）。副作用不该为一个问题跑两次。测试用 autouse fixture 清缓存，否则 monkeypatch 会污染后续用例 |
 
 ### Verifier 沙箱流程
 

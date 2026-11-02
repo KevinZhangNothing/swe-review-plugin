@@ -62,11 +62,27 @@ text, tok = await adapter.chat(system=..., user=..., max_tokens=4096, temperatur
 
 ```python
 from swe_review import PiAdapter
-a = PiAdapter(skills_source_dir="skills_md")  # 默认从根目录 skills_md/
+a = PiAdapter()  # skills_source_dir 省略 → 自动解析（见下）
 await a.install_skills()  # 写到 ~/.pi/agent/skills/swe-review/<name>/
 ```
 
-CLI 等价：`swe-review install-skills --source ...`。
+`skills_source_dir=None` 时的解析顺序（结果恒为绝对路径，与 CWD 无关）：
+
+1. `swe_review/.claude_skills/` —— 随包分发，`pip install` 后可用；
+2. `<repo>/.claude/skills/` —— 开发态回退。
+
+包内副本由 `scripts/sync_skill_sources.py` 从 `.claude/skills/` 镜像生成，
+`.claude/skills/` 始终是唯一可编辑的事实源。改动 skill 后跑一次同步：
+
+```bash
+python scripts/sync_skill_sources.py          # 同步
+python scripts/sync_skill_sources.py --check  # CI 门禁（不一致则退出 1）
+```
+
+CLI 等价：`swe-review install-skills [--source ...]`，默认同样走上述解析。
+显式传 `--source` 时以传入值为准（相对路径会按 CWD 解析，请自备绝对路径）。
+源目录里没有任何含 `SKILL.md` 的子目录时，命令**以退出码 1 失败** ——
+此前默认值是并不存在的 `skills_md/`，安装 0 个 skill 却仍返回 0。
 
 ## 怎么写一个新的 Adapter（假设未来要支持 Codex CLI）
 
