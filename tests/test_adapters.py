@@ -35,9 +35,16 @@ def test_pi_status():
 
 
 def test_shell_status():
+    """The offline stub is never "configured": it makes no LLM call.
+
+    It used to report configured=True, which made `list-tools` present the
+    placeholder as a working backend while it returned a fixed
+    `request_changes` payload regardless of the diff.
+    """
     s = ShellTools().get_status()
     assert s["name"] == "shell"
-    assert s["configured"] is True
+    assert s["configured"] is False
+    assert s["backend"] == "shell-placeholder"
 
 
 def test_adapters_share_chat_signature():

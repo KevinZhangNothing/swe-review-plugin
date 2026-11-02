@@ -37,4 +37,16 @@ class ShellTools:
         return text, tok
 
     def get_status(self) -> Dict[str, Any]:
-        return {"name": self.name, "configured": True, "backend": "shell-placeholder"}
+        # `configured` answers "is this backend wired to a real LLM?" — for the
+        # stub that is False, because it calls nothing. `is_placeholder` names
+        # the actual nature of the adapter, so a consumer that wants to *list*
+        # shell (or render it differently) does not have to overload one boolean
+        # with two meanings. Both fields are additive; nothing is removed.
+        return {
+            "name": self.name,
+            "configured": False,
+            "is_placeholder": True,
+            "backend": "shell-placeholder",
+            "hint": "Offline stub: returns a fixed request_changes payload without "
+                    "calling any LLM. Use it for pipeline smoke tests only.",
+        }

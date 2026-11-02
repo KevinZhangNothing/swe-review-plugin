@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 from .base import MODEL_INHERITED_NOTE
@@ -27,13 +28,23 @@ from ._pty_runner import (
 
 def _find_cli() -> str:
     # CLI_BIN_* is the legacy name install.sh used to write; kept for existing env files.
-    return (
-        os.environ.get("OPENCODE_BIN")
-        or os.environ.get("CLI_BIN_OPENCODE")
-        or os.path.expanduser("~/.opencode/bin/opencode")
-        or shutil.which("opencode")
-        or "opencode"
-    )
+    #
+    # The ~/.opencode/bin/opencode candidate used to sit in this `or` chain
+    # unguarded. `os.path.expanduser()` ALWAYS returns a non-empty string, so it
+    # was unconditionally truthy and `shutil.which("opencode")` was dead code:
+    # an opencode installed on PATH (e.g. Homebrew, npm -g) was never found and
+    # the adapter reported itself unconfigured. Check the path really exists.
+    candidates = [
+        os.environ.get("OPENCODE_BIN"),
+        os.environ.get("CLI_BIN_OPENCODE"),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    default_install = Path("~/.opencode/bin/opencode").expanduser()
+    if default_install.is_file():
+        return str(default_install)
+    return shutil.which("opencode") or "opencode"
 
 
 class OpenCodeAdapter:

@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .tools import ADAPTER_NAMES, CLI_ADAPTER_NAMES, DEFAULT_HOST_DIR
+from .tools import ADAPTER_NAMES, CLI_ADAPTER_NAMES, DEFAULT_HOST_DIR, ToolNotFound
 from .tools.host_adapter import HostTurnRequired
 from .subagents.diff_sharding import (
     DEFAULT_SHARD_BUDGET_CHARS,
@@ -46,10 +46,15 @@ def _emit(obj) -> None:
 
 
 def _adapter_from_args(args):
-    """Build the adapter named by `--tool` via the single-source registry."""
-    from .tools import build_adapter
+    """Build the adapter named by `--tool` via the single-source registry.
+
+    ``auto`` (the default) is resolved to a concrete backend here rather than in
+    argparse, so `--help` stays cheap and the resolution error can name the
+    binaries that were looked for.
+    """
+    from .tools import build_adapter, resolve_adapter_name
     return build_adapter(
-        args.tool,
+        resolve_adapter_name(getattr(args, "tool", None)),
         timeout=getattr(args, "timeout", None),
         host_dir=getattr(args, "host_dir", None),
         agent=getattr(args, "agent", None),
@@ -100,11 +105,29 @@ async def _cmd_health(_args) -> None:
     ]})
 
 
-async def _cmd_install_skills(args) -> None:
+async def _cmd_install_skills(args) -> int:
     from .tools.pi_adapter import PiAdapter
-    a = PiAdapter(skills_dir=args.pi_skills_dir, skills_source_dir=args.source)
+    # `--source` defaults to None so PiAdapter resolves the skill directory
+    # itself (packaged `swe_review/.claude_skills/` first, then the repo's
+    # `.claude/skills/`). A literal relative default made this command depend on
+    # the process CWD: run from anywhere but the repo root, it found nothing.
+    a = PiAdapter(skills_dir=args.pi_skills_dir,
+                  skills_source_dir=args.source or None)
     installed = await a.install_skills()
     _emit({"installed": installed})
+    # An empty `installed` used to exit 0, so a wrong --source silently
+    # "succeeded" while nothing was copied. Fail loudly instead — by RETURNING
+    # the code, like every other handler, so there is one exit convention
+    # (`main` maps a non-zero handler return to the process exit code).
+    if not installed:
+        print(
+            f"install-skills: nothing installed. No directory under "
+            f"{a.skills_source_dir} contains a SKILL.md — check --source "
+            f"(the skill sources live in .claude/skills/).",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 async def _cmd_review(args) -> None:
@@ -252,6 +275,21 @@ def _build_check_config(args) -> dict:
     return {k: v for k, v in cfg.items() if v is not None}
 
 
+def _add_sandbox_args(p) -> None:
+    """Sandbox toggle, shared by `verify` and `loop`.
+
+    `loop` used to lack these flags entirely while `--compile-cmd`'s help told
+    users to "pair with --no-sandbox for incremental builds" — so that documented
+    path was unreachable from `loop` (argparse rejected the flag) and `loop` was
+    permanently sandboxed via `getattr(args, "sandbox", True)`.
+    """
+    p.add_argument("--sandbox", dest="sandbox", action="store_true", default=True,
+                   help="apply patch in tempdir (default; safe)")
+    p.add_argument("--no-sandbox", dest="sandbox", action="store_false",
+                   help="apply patch in the real worktree (needed for iOS incremental "
+                        "builds that reuse Pods/DerivedData)")
+
+
 def _add_build_check_args(p) -> None:
     p.add_argument("--no-build-check", action="store_true",
                    help="skip the build/dependency check phase after applying the patch")
@@ -307,11 +345,23 @@ def _add_shard_args(p) -> None:
 
 
 def _add_tool_arg(p) -> None:
-    """`--tool` is registry-driven (single source of truth: swe_review/tools)."""
-    p.add_argument("--tool", default="shell", choices=list(ADAPTER_NAMES),
-                   help="LLM backend. 'host' = answer with the agent that is "
-                        "running this command (no external CLI is spawned); "
-                        "'shell' = offline placeholder (no LLM).")
+    """`--tool` is registry-driven (single source of truth: swe_review/tools).
+
+    Default is ``auto``: the first CLI adapter resolvable on $PATH wins. This is
+    NOT the old behaviour — the old default was `shell`, an offline stub that
+    returns a fixed `request_changes` payload without calling any LLM, so
+    `swe-review review` printed a structurally complete, scored, confidently
+    worded report that had analysed nothing.
+
+    ``auto`` never resolves to `shell`; when nothing is installed the command
+    fails with a message naming the binaries it looked for. `shell` remains
+    selectable explicitly for pipeline smoke tests.
+    """
+    p.add_argument("--tool", default="auto", choices=["auto", *ADAPTER_NAMES],
+                   help="LLM backend (default: auto = first CLI found on PATH). "
+                        "'host' = answer with the agent running this command "
+                        "(no external CLI is spawned); 'shell' = offline "
+                        "placeholder (no LLM) — smoke tests only.")
 
 
 def _add_host_args(p) -> None:
@@ -346,7 +396,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("health", help="live-test each tool with a trivial prompt")
 
     p_ins = sub.add_parser("install-skills", help="copy swe-review SKILL.md dirs to Pi")
-    p_ins.add_argument("--source", default="skills_md", help="source dir with SKILL.md subdirs")
+    p_ins.add_argument("--source", default=None,
+                       help="source dir with SKILL.md subdirs (default: resolved "
+                            "from the package — swe_review/.claude_skills/, then "
+                            "the repo's .claude/skills/; never CWD-relative)")
     p_ins.add_argument("--pi-skills-dir", default="~/.pi/agent/skills", help="destination root")
 
     p_rev = sub.add_parser("review", help="review a candidate PR")
@@ -430,6 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_loop.add_argument("--timeout", type=int, default=600,
                         help="per-call adapter timeout in seconds; engineering "
                              "reviews take ~6-9 min, so 900+ is safer for pi")
+    _add_sandbox_args(p_loop)
     _add_build_check_args(p_loop)
     p_loop.set_defaults(handler=_cmd_loop)
 
@@ -444,11 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
                             "default python/pytest/node runner chain")
     p_ver.add_argument("--oracle", default=None,
                        help="optional gold patch (evaluation only, never injected to review prompt)")
-    p_ver.add_argument("--sandbox", dest="sandbox", action="store_true", default=True,
-                       help="apply patch in tempdir (default; safe)")
-    p_ver.add_argument("--no-sandbox", dest="sandbox", action="store_false",
-                       help="apply patch in the real worktree (needed for iOS incremental "
-                            "builds that reuse Pods/DerivedData)")
+    _add_sandbox_args(p_ver)
     _add_build_check_args(p_ver)
     p_ver.set_defaults(handler=_cmd_verify)
 
@@ -543,15 +593,23 @@ def main(argv: Optional[list] = None) -> int:
             asyncio.run(_cmd_health(args))
             return 0
         if args.cmd == "install-skills":
-            asyncio.run(_cmd_install_skills(args))
-            return 0
+            # A handler may return an exit code; `None` means success. One
+            # convention for every command instead of mixing `return 0` with
+            # handlers that raise SystemExit themselves.
+            return asyncio.run(_cmd_install_skills(args)) or 0
         if hasattr(args, "handler"):
-            asyncio.run(args.handler(args))
-            return 0
+            return asyncio.run(args.handler(args)) or 0
     except HostTurnRequired as exc:
         # `--tool host`: this run cannot continue until the host agent answers.
         _emit(_awaiting_host_envelope(exc))
         return EXIT_AWAITING_HOST
+    except ToolNotFound as exc:
+        # `--tool auto` with nothing installed. A traceback here would bury the
+        # one line the user actually needs. Dedicated exception type, NOT a
+        # message-substring match: the exit path must not break when wording
+        # changes, and unrelated ValueErrors must still surface as bugs.
+        print(f"swe-review: {exc}", file=sys.stderr)
+        return 2
 
     parser.print_help()
     return 1

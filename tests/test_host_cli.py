@@ -65,7 +65,8 @@ def test_tool_choices_come_from_registry():
                         seen.append(a.choices)
     assert len(seen) == 3, f"expected review/revise/loop --tool, saw {len(seen)}"
     for choices in seen:
-        assert list(choices) == list(ADAPTER_NAMES)
+        # `auto` is the default sentinel and is resolved before build_adapter.
+        assert list(choices) == ["auto", *ADAPTER_NAMES]
 
 
 def test_parser_accepts_host_dir_and_agent():
