@@ -20,5 +20,16 @@ swe-review = "swe_review.cli:main"
 where = ["."]
 include = ["swe_review*"]
 
+# The SKILL.md sources ship INSIDE the package tree, because `install-skills`
+# resolves them from the installed location (`swe_review/.claude_skills/`,
+# see PiAdapter.__init__). Without them a wheel install has no skill source:
+# the fallback path points at `<site-packages>/.claude/skills`, which setuptools
+# never creates.
+#
+# Deliberately NOT `[tool.setuptools.data-files]`: that installs to
+# `sys.prefix/swe_review/...` (verified by inspecting the built wheel — entries
+# land under `<name>-<ver>.data/data/`), i.e. outside the importable package.
+# The sources are mirrored into `swe_review/.claude_skills/` by
+# `scripts/sync_skill_sources.py` so they remain package data.
 [tool.setuptools.package-data]
-swe_review = ["py.typed"]
+swe_review = ["py.typed", ".claude_skills/*/SKILL.md"]
