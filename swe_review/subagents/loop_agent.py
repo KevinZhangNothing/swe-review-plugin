@@ -20,6 +20,74 @@ from pathlib import Path
 
 from .reviewer_agent import DECISION_APPROVING
 from ..tools.decisions import choose_revision_action, findings_digest
+from ..tools.base import accum_usage
+from ..tools.host_adapter import HostTurnRequired
+
+
+def _is_protocol_signal(exc: BaseException) -> bool:
+    """True for exceptions that must NEVER be swallowed by error isolation.
+
+    ``HostTurnRequired`` is a *control signal*, not a failure: under ``--tool
+    host`` it means "a prompt is on disk and nobody has answered it yet". The
+    concurrent waves below use ``asyncio.gather(return_exceptions=True)`` so one
+    bad candidate cannot sink a batch — but that also converted this signal into
+    an empty candidate, so `best_of_n` printed "no candidate approved+verified"
+    and exited 0 while two unanswered prompts sat in the rendezvous dir. The
+    caller could never learn what to do next.
+    """
+    return isinstance(exc, HostTurnRequired)
+
+
+def _raise_protocol_signals(results: List[Any]) -> None:
+    """Re-raise the first protocol signal found in a `gather` result list."""
+    for r in results:
+        if isinstance(r, BaseException) and _is_protocol_signal(r):
+            raise r
+
+
+def has_code_evidence(exploration: Any) -> bool:
+    """True when an exploration payload actually resolved code in the repo.
+
+    `keywords` is derived from the ISSUE TEXT, so it is populated even when the
+    explorer matched nothing — it is not evidence. Only a resolved file or call
+    chain counts. Shared with `GenerateSkill.explore`, which must answer the same
+    question when tagging its own degraded state; two copies of this predicate
+    would eventually disagree about what "found nothing" means.
+    """
+    if not isinstance(exploration, dict):
+        return False
+    return bool(exploration.get("files_modified")
+                or exploration.get("related_files")
+                or exploration.get("call_chain"))
+
+
+def _tag_shared_exploration(exploration: Any, has_repo: bool) -> Dict[str, Any]:
+    """Normalize the shared exploration into a context dict that states its own health.
+
+    The per-candidate explorer tags its own failures (`_degraded_context`), but
+    best_of_n's shared-exploration shortcut bypassed that path: when the shared
+    call came back `None` or `{}` every candidate received a bare empty mapping
+    and the resulting report had no way to say "no repository evidence was used".
+    Returns a dict with `exploration_degraded` set when evidence is missing;
+    an already-tagged or non-empty result passes through untouched.
+    """
+    if not isinstance(exploration, dict):
+        exploration = {}
+    if exploration.get("exploration_degraded"):
+        return exploration
+    if has_code_evidence(exploration):
+        return exploration
+    return {
+        **exploration,
+        "exploration_degraded": (
+            "shared_exploration_empty: the loop's single shared explorer pass "
+            "returned no usable context, so every candidate was reviewed without "
+            "repository evidence"
+            if has_repo else
+            "shared_exploration_skipped: no repo_path supplied, so no exploration "
+            "was possible"
+        ),
+    }
 
 
 def _unwrap_skill(out: Any) -> Dict[str, Any]:
@@ -101,6 +169,12 @@ class LoopResult:
     resolve_rate: float = 0.0  # 来自 verifier（如提供 oracle）
     token_usage_total: Optional[Dict[str, int]] = None
     strategy: str = "review_guided"
+    # Which orchestrator path actually ran. `strategy` is what the caller ASKED
+    # for; these two diverge legitimately (best_of_n/hybrid delegate to
+    # review_guided when an explicit initial_pr is supplied, because there is
+    # nothing to generate). Recording both keeps a debugger from being told
+    # "best_of_n ran" when no candidate was ever generated.
+    executed_strategy: str = ""
     elapsed_seconds: float = 0.0
     message: str = ""
     # 最终 verdict 所依据的执行证据等级：
@@ -182,7 +256,8 @@ class LoopSubAgent:
             r = await self._run_best_of_n(issue, repo_path, n_best, t0,
                                           prompt_style=prompt_style,
                                           test_info=test_info,
-                                          test_runner=test_runner)
+                                          test_runner=test_runner,
+                                          initial_pr=initial_pr)
         elif strategy == "hybrid":
             r = await self._run_hybrid(issue, repo_path, initial_pr, n_best, t0,
                                        max_iter=max_iter,
@@ -198,6 +273,19 @@ class LoopSubAgent:
                                               test_runner=test_runner)
 
         r.elapsed_seconds = (datetime.now() - t0).total_seconds()
+        # Ownership split, deliberately one-way:
+        #   `strategy`           — what the CALLER asked for. Only set here.
+        #   `executed_strategy`  — what actually ran. Only the orchestrators
+        #                          (`_run_*`) set it, because only they know
+        #                          about delegation (hybrid → best_of_n →
+        #                          review_guided, and initial_pr short-circuits).
+        # `execute` never guesses it. The fallback below exists only so a future
+        # orchestrator that forgets to record itself degrades to the requested
+        # strategy instead of shipping an empty field.
+        r.strategy = strategy
+        if not r.executed_strategy:
+            r.executed_strategy = strategy if strategy in (
+                "review_guided", "best_of_n") else "review_guided"
         if self.output_dir:
             self.save_log(r)
         return r
@@ -229,6 +317,7 @@ class LoopSubAgent:
         # 如果没有 initial_pr 且有 generator，则先生成一个
         if not current_pr.get("diff") and self.generator_skill:
             gen = await self._generate(issue, repo_path)
+            accum_usage(token_total, gen.get("token_usage"))
             iterations.append(self._mk_iter(1, "generate", "n/a", gen.get("confidence", 0.5), 0,
                                             notes=gen.get("rationale", "")))
             current_pr = {
@@ -253,7 +342,7 @@ class LoopSubAgent:
             it.review_payload = rev
             it.audit = _review_audit(rev)
             iterations.append(it)
-            self._accum_tokens(token_total, rev.get("token_usage"))
+            accum_usage(token_total, rev.get("token_usage"))
 
             # Completely unparseable review output carries no actionable feedback;
             # blind revision cannot converge — stop early with an explicit verdict.
@@ -269,6 +358,7 @@ class LoopSubAgent:
                     resolve_rate=0.0,
                     token_usage_total=token_total,
                     strategy="review_guided",
+                    executed_strategy="review_guided",
                     verification_status="not_run",
                     message="review output unparseable; no actionable feedback — loop stopped",
                 )
@@ -308,6 +398,7 @@ class LoopSubAgent:
                     resolve_rate=rr["resolve_rate"] if rr else 0.0,
                     token_usage_total=token_total,
                     strategy="review_guided",
+                    executed_strategy="review_guided",
                     verification_status=rr["evidence_level"] if rr else "not_run",
                     message=(f"verification failed at iteration {i}: {rr['details']}"
                              if verification_failed
@@ -330,6 +421,7 @@ class LoopSubAgent:
                 gen = await self._generate(
                     issue, repo_path,
                     prior_failures=[_failure_summary(current_pr, rev)])
+                accum_usage(token_total, gen.get("token_usage"))
                 if gen.get("diff"):
                     iterations.append(self._mk_iter(
                         i, "regenerate", "ok", gen.get("confidence", 0.5),
@@ -356,6 +448,7 @@ class LoopSubAgent:
                                         feedback_level=feedback_level)
             if not new_pr or not new_pr.get("diff"):
                 why = (new_pr or {}).get("status") or "no_output"
+                accum_usage(token_total, (new_pr or {}).get("token_usage"))
                 iterations.append(self._mk_iter(
                     i, "revise", "failed", 0.0, 0,
                     notes=f"empty diff (revise status={why})"))
@@ -365,6 +458,7 @@ class LoopSubAgent:
                 stop_reason = (f"revise produced no usable diff at iteration {i} "
                                f"(reviser status={why})")
                 break
+            accum_usage(token_total, new_pr.get("token_usage"))
             iterations.append(self._mk_iter(i, "revise", "ok",
                                             0.5, len(rev.get("defects", [])), notes=new_pr.get("changes_summary", "")))
             current_pr = new_pr
@@ -388,6 +482,7 @@ class LoopSubAgent:
             resolve_rate=rr["resolve_rate"] if rr else 0.0,
             token_usage_total=token_total,
             strategy="review_guided",
+            executed_strategy="review_guided",
             verification_status=rr["evidence_level"] if rr else "not_run",
             message=stop_reason,
         )
@@ -404,6 +499,7 @@ class LoopSubAgent:
         prompt_style: Optional[str] = None,
         test_info: Optional[Dict[str, Any]] = None,
         test_runner: Optional[List[str]] = None,
+        initial_pr: Optional[Dict[str, Any]] = None,
     ) -> LoopResult:
         """Wave-based best-of-N (swarm-style).
 
@@ -415,17 +511,49 @@ class LoopSubAgent:
         Adjudication is evidence-first: an approved candidate only succeeds
         when verify passes; review confidence is used for ordering, never as
         a substitute for executable evidence.
+
+        An explicit ``initial_pr`` skips generation entirely — same contract as
+        ``_run_hybrid`` and ``--initial-pr-diff``: "review/revise THIS candidate".
+        Without this branch the supplied patch was silently discarded and the
+        loop generated its own candidates instead.
         """
         from .generator_agent import PERSPECTIVE_ROTATION
 
         iterations: List[LoopIteration] = []
         token_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
+        if initial_pr and initial_pr.get("diff"):
+            rg = await self._run_review_guided(
+                issue, repo_path, initial_pr, self.max_iterations, t0,
+                prompt_style=prompt_style,
+                test_info=test_info,
+                test_runner=test_runner,
+            )
+            # Delegation, stated once because it looks like a contradiction otherwise:
+            # this method was asked for best_of_n, but with an explicit patch in
+            # hand there is nothing to generate — only to review. So it runs the
+            # review_guided orchestrator and returns ITS result, which reports
+            # `executed_strategy="review_guided"` (set by that method, not here)
+            # while `execute()` records the REQUESTED `strategy="best_of_n"`.
+            # Both fields are then truthful: what was asked, and what ran.
+            #
+            # Record the skipped phase too: without it the timeline opens with a
+            # `review` iteration and "why was no candidate generated?" is
+            # unanswerable from the LoopResult alone.
+            rg.iterations.insert(0, self._mk_iter(
+                0, "generate", "skipped", 0.0, 0,
+                notes="best_of_n: initial_pr supplied — candidate generation skipped"))
+            rg.total_iterations = len(rg.iterations)
+            rg.message = (f"best_of_n: initial PR supplied → generation skipped; "
+                          f"{rg.message}")
+            return rg
+
         if not self.generator_skill:
             return LoopResult(
                 success=False, final_decision="no_generator",
                 final_pr_diff="", total_iterations=0, iterations=[],
                 token_usage_total=token_total, strategy="best_of_n",
+                    executed_strategy="best_of_n",
                 message="generator_skill is required for best_of_n",
             )
 
@@ -452,6 +580,9 @@ class LoopSubAgent:
                 )
                 for j in range(wave)
             ], return_exceptions=True)
+            # A host turn is a control signal, not a candidate failure: re-raise
+            # before the error-isolation branch below turns it into "".
+            _raise_protocol_signals(gens_raw)
             # Error isolation: one candidate's failure must not sink the wave
             # (self-review P1). Failed generates become empty candidates that
             # skip review; failed reviews become untrusted rejections.
@@ -471,11 +602,22 @@ class LoopSubAgent:
                             "defects": [], "findings": [],
                             "parse_error": "skipped: empty generated diff",
                             "token_usage": None}
-                return await self._review(issue, pr, repo_path,
-                                          prompt_style=prompt_style)
+                # Reuse the shared exploration: every candidate targets the SAME
+                # repo + issue, so re-running the explorer once per candidate was
+                # pure redundancy (measured: N=3 → 3 explorer passes).
+                # Tagged here rather than at the shared call site: the generator
+                # consumes the raw payload (and tests pin that it arrives
+                # unmodified), while only the REVIEWER needs to know whether the
+                # evidence base was empty.
+                return await self._review(
+                    issue, pr, repo_path,
+                    prompt_style=prompt_style,
+                    repo_context=_tag_shared_exploration(
+                        exploration, has_repo=bool(repo_path)))
 
             revs_raw = await asyncio.gather(
                 *[_review_or_skip(pr) for pr in prs], return_exceptions=True)
+            _raise_protocol_signals(revs_raw)
             revs: List[Dict[str, Any]] = [
                 r if not isinstance(r, Exception) else {
                     "decision": "request_changes", "confidence": 0.0,
@@ -486,6 +628,7 @@ class LoopSubAgent:
             ]
             for j, (gen, pr, rev) in enumerate(zip(gens, prs, revs)):
                 idx = k + j + 1
+                accum_usage(token_total, gen.get("token_usage"))
                 iterations.append(self._mk_iter(
                     idx, "generate", "n/a", gen.get("confidence", 0.5), 0,
                     notes=gen.get("rationale", "")))
@@ -499,7 +642,7 @@ class LoopSubAgent:
                 it.review_payload = rev
                 it.audit = _review_audit(rev)
                 iterations.append(it)
-                self._accum_tokens(token_total, rev.get("token_usage"))
+                accum_usage(token_total, rev.get("token_usage"))
                 approved = (not rev_unreliable
                             and rev.get("decision") in DECISION_APPROVING)
                 candidates.append({
@@ -537,6 +680,7 @@ class LoopSubAgent:
                     total_iterations=len(iterations), iterations=iterations,
                     resolve_rate=resolve_rate, token_usage_total=token_total,
                     strategy="best_of_n",
+                    executed_strategy="best_of_n",
                     verification_status=verification_status,
                     message=f"candidate {c['idx']}/{len(candidates)} approved+verified",
                 )
@@ -568,6 +712,7 @@ class LoopSubAgent:
                     total_iterations=len(iterations), iterations=iterations,
                     resolve_rate=resolve_rate, token_usage_total=token_total,
                     strategy="best_of_n",
+                    executed_strategy="best_of_n",
                     verification_status=verification_status,
                     message=(f"candidate {c['idx']} verify-passed but "
                              "review-rejected; returning as evidence-ranked best"),
@@ -578,6 +723,7 @@ class LoopSubAgent:
             final_pr_diff=best_diff, total_iterations=len(iterations),
             iterations=iterations, resolve_rate=resolve_rate,
             token_usage_total=token_total, strategy="best_of_n",
+                    executed_strategy="best_of_n",
             verification_status=verification_status,
             message=f"no candidate approved+verified in {len(candidates)}",
         )
@@ -612,7 +758,7 @@ class LoopSubAgent:
                 test_info=test_info,
                 test_runner=test_runner,
             )
-            rg.strategy = "hybrid"
+            # `execute` owns strategy/executed_strategy (single source).
             # Record the skipped phase explicitly: without it the timeline opens
             # with a `review` iteration, so "why was no candidate generated?"
             # cannot be answered from the LoopResult alone.
@@ -628,7 +774,8 @@ class LoopSubAgent:
                                         test_info=test_info,
                                         test_runner=test_runner)
         if bon.success:
-            bon.strategy = "hybrid"
+            # `bon.executed_strategy` already says "best_of_n" (set by
+            # `_run_best_of_n`); `execute` records the requested "hybrid".
             bon.message = f"hybrid: best_of_n approved in {n} candidates"
             return bon
         # 用 best candidate 作为初始 PR，跑 review_guided
@@ -639,7 +786,8 @@ class LoopSubAgent:
                                            feedback_level=feedback_level,
                                            test_info=test_info,
                                            test_runner=test_runner)
-        rg.strategy = "hybrid"
+        # `rg.executed_strategy` already says "review_guided" (set by
+        # `_run_review_guided`); `execute` records the requested "hybrid".
         rg.iterations = bon.iterations + rg.iterations
         rg.total_iterations = len(rg.iterations)
         rg.message = f"hybrid: best_of_n failed → review_guided took over; {rg.message}"
@@ -649,11 +797,12 @@ class LoopSubAgent:
     # Primitive wrappers (skill 层也可能实现)
     # ==================================================================
     async def _review(self, issue: str, pr: Dict[str, Any], repo_path: Optional[str],
-                       prompt_style: Optional[str] = None) -> Dict[str, Any]:
+                       prompt_style: Optional[str] = None,
+                       repo_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not self.review_skill:
             return {"decision": "request_changes", "confidence": 0.5,
                     "defects": [], "token_usage": None}
-        out = await self.review_skill.execute(
+        kwargs: Dict[str, Any] = dict(
             issue=issue,
             pr_title=pr.get("title", ""),
             pr_body=pr.get("body", ""),
@@ -661,6 +810,9 @@ class LoopSubAgent:
             repo_path=repo_path,
             prompt_style=prompt_style,
         )
+        if repo_context is not None:
+            kwargs["repo_context"] = repo_context
+        out = await self.review_skill.execute(**kwargs)
         # SkillResult 信封解包（修复：此前直接读信封顶层导致 decision
         # 恒为默认值 request_changes、defects 恒空、revise 恒 empty diff）
         d = _unwrap_skill(out)
@@ -695,7 +847,8 @@ class LoopSubAgent:
             return {"title": d.get("title", ""), "body": d.get("body", ""),
                     "diff": d.get("diff", ""),
                     "changes_summary": d.get("changes_summary", ""),
-                    "status": d.get("status", "")}
+                    "status": d.get("status", ""),
+                    "token_usage": d.get("token_usage")}
         return None
 
     async def _generate(
@@ -779,12 +932,6 @@ class LoopSubAgent:
             token_usage=token_usage,
             notes=notes,
         )
-
-    def _accum_tokens(self, total: Dict[str, int], add: Optional[Dict[str, int]]) -> None:
-        if not add:
-            return
-        for k, v in add.items():
-            total[k] = total.get(k, 0) + (v or 0)
 
     def save_log(self, result: LoopResult, filename: Optional[str] = None) -> Path:
         if not self.output_dir:

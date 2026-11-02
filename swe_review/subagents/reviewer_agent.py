@@ -44,6 +44,7 @@ from .diff_sharding import (
     should_shard,
 )
 from .engineering_prompt import parse_diff_files, strip_fences, truncate_json_text
+from ..tools.base import accum_usage
 from ..tools.host_adapter import HostTurnRequired
 
 
@@ -228,7 +229,15 @@ class ReviewReport:
     # reviewer saw a truncated evidence base — loop logs use it as the
     # zero-cost proxy for evidence_missing failures.
     exploration_truncated: bool = False
+    # Set when the explorer never ran (timeout / raised) and the reviewer fell
+    # back to static diff-only context. Without this an evidence-free report is
+    # indistinguishable from a repository-grounded one.
+    exploration_degraded: str = ""
     prompt_style: str = "engineering"  # "engineering" | "concise" | "detailed"
+    # Adapter that produced this report (e.g. "shell" = offline placeholder, no
+    # LLM call was made). Lets the skill layer tag a report as degraded instead
+    # of letting a structurally complete fake look like a real review.
+    tool_name: str = ""
 
     def __post_init__(self):
         if not self.timestamp:
@@ -289,11 +298,33 @@ class ReviewReport:
             "token_usage": self.token_usage,
             "exploration_steps": self.exploration_steps,
             "exploration_truncated": self.exploration_truncated,
+            "exploration_degraded": self.exploration_degraded,
             "prompt_style": self.prompt_style,
+            "tool_name": self.tool_name,
         }
 
     def to_json(self, indent: int = 2, deep: bool = False) -> str:
         return json.dumps(self.to_dict(deep=deep), indent=indent, ensure_ascii=False)
+
+
+#: Cap for an exception message echoed into a serialized report. The degraded
+#: reason reaches `payload["degraded"]` in CLI JSON output, which is routinely
+#: pasted into issues and CI logs — a library-internal message can carry an
+#: absolute path, a config value, or a fragment of a prompt. The type name is
+#: what a maintainer actually needs to triage; the body is a bonus, so it is
+#: bounded rather than forwarded verbatim.
+_EXC_DETAIL_CHARS = 200
+
+
+def _safe_exc_summary(exc: BaseException) -> str:
+    """`TypeName: message` with the message bounded for serialization."""
+    name = type(exc).__name__
+    detail = str(exc or "").strip()
+    if not detail:
+        return name
+    if len(detail) > _EXC_DETAIL_CHARS:
+        detail = detail[:_EXC_DETAIL_CHARS] + "…(truncated)"
+    return f"{name}: {detail}"
 
 
 def _normalize_location_flat(loc: Any) -> str:
@@ -639,7 +670,15 @@ class ReviewerSubAgent:
         # 1) Explore
         repo_context: Dict[str, Any] = {}
         exploration_steps = 0
-        if repo_path and self.explorer:
+        # A caller that already explored THIS repo for THIS issue (best_of_n
+        # shares one exploration across all candidates) passes it in; skipping
+        # the re-run removes one full explorer pass per candidate. Explicit
+        # None means "not supplied" and falls through to a fresh exploration.
+        supplied_context = context.get("repo_context")
+        if supplied_context is not None:
+            repo_context = dict(supplied_context)
+            exploration_steps = int(repo_context.get("steps") or 0)
+        elif repo_path and self.explorer:
             repo_context, exploration_steps = await self._explore(
                 repo_path=repo_path,
                 issue=issue,
@@ -719,6 +758,8 @@ class ReviewerSubAgent:
 
         report.exploration_steps = exploration_steps
         report.exploration_truncated = bool(repo_context.get("truncated"))
+        report.exploration_degraded = str(repo_context.get("exploration_degraded") or "")
+        report.tool_name = str(getattr(self.tool_adapter, "name", "") or "")
         return report
 
     async def _review_once(
@@ -1025,8 +1066,15 @@ class ReviewerSubAgent:
                 }),
                 timeout=self.explore_timeout,
             )
-        except (asyncio.TimeoutError, Exception):
-            return self._static_diff_context(pr_diff), 0
+        except asyncio.TimeoutError:
+            # Split from the generic branch on purpose: a timeout is an
+            # infrastructure limit, a raised exception is a bug. Collapsing both
+            # into one `except Exception` (the previous form) made the loop's
+            # audit trail unable to say WHICH degradation happened.
+            return self._degraded_context(pr_diff, "explore_timeout"), 0
+        except Exception as exc:
+            return self._degraded_context(
+                pr_diff, f"explore_error: {_safe_exc_summary(exc)}"), 0
 
         if hasattr(result, "to_dict"):
             ctx = result.to_dict()
@@ -1038,6 +1086,17 @@ class ReviewerSubAgent:
             ctx = {"raw": str(result)}
             steps = 0
         return ctx, steps
+
+    def _degraded_context(self, pr_diff: str, reason: str) -> Dict[str, Any]:
+        """Static fallback context, tagged with WHY the explorer did not run.
+
+        The tag rides in the context dict and is surfaced by `execute` as
+        ``exploration_degraded`` so a report built without repository evidence
+        can be told apart from one built with it.
+        """
+        ctx = self._static_diff_context(pr_diff)
+        ctx["exploration_degraded"] = reason
+        return ctx
 
     def _static_diff_context(self, pr_diff: str) -> Dict[str, Any]:
         return {
@@ -1390,12 +1449,10 @@ def _context_for_shard(repo_context: Dict[str, Any],
 
 
 def _merge_token_usage(a: Optional[Dict[str, int]], b: Optional[Dict[str, int]]) -> Dict[str, int]:
+    """Fold two usage dicts into a new one (shared arithmetic: tools.base)."""
     merged: Dict[str, int] = {}
-    for usage in (a, b):
-        if not usage:
-            continue
-        for k, v in usage.items():
-            merged[k] = merged.get(k, 0) + (v or 0)
+    accum_usage(merged, a)
+    accum_usage(merged, b)
     return merged
 
 

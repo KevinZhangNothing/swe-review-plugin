@@ -53,6 +53,10 @@ class GeneratedPR:
     diff: str
     rationale: str
     confidence: float
+    # Generation is the most output-heavy call in the loop, yet its usage never
+    # reached `LoopResult.token_usage_total` (that only accumulated review
+    # usage), so best_of_n's N generations were invisible in the cost report.
+    token_usage: Optional[Dict[str, int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -88,8 +92,10 @@ class GeneratorSubAgent:
         sys_p = self._system_prompt(perspective=perspective)
         usr_p = self._user_prompt(issue=issue, hint=hint, repo_path=repo_path,
                                   exploration=exploration, prior_failures=prior_failures)
-        response, _ = await self._call(sys_p, usr_p)
-        return self._parse(response)
+        response, usage = await self._call(sys_p, usr_p)
+        pr = self._parse(response)
+        pr.token_usage = usage or None
+        return pr
 
     def _system_prompt(self, perspective: Optional[str] = None) -> str:
         base = (

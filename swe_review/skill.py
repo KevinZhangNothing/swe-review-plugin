@@ -19,7 +19,7 @@ from .subagents.explorer_agent import ExplorerSubAgent, ExplorationResult
 from .subagents.verifier_agent import VerifierSubAgent, VerificationResult
 from .subagents.analyzer_agent import AnalyzerSubAgent, AnalyzerResult
 from .subagents.generator_agent import GeneratorSubAgent, GeneratedPR
-from .subagents.loop_agent import LoopSubAgent, LoopResult
+from .subagents.loop_agent import LoopSubAgent, LoopResult, has_code_evidence
 # stdlib-only module, so a top-level import carries no cycle risk
 from .subagents.location_grounding import ground_report_locations, unverified_high_severity
 from .subagents.diff_sharding import (
@@ -37,6 +37,66 @@ class SkillResult:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _tool_name(tool_adapter) -> str:
+    """The adapter name used for degradation tagging — ONE lookup path.
+
+    Review read it off the finished `report.tool_name` while revise read it off
+    `self.tool.name` directly. Both currently resolve to the same string, but
+    two sources for one fact is how a future rename silently stops tagging one
+    command. Everything goes through here.
+    """
+    return str(getattr(tool_adapter, "name", "") or "")
+
+
+def _degraded_reasons(tool_name: str, report=None) -> List[str]:
+    """Every reason a result rests on degraded evidence.
+
+    Applied consistently by every skill that calls an LLM adapter — review,
+    revise AND generate — so the SAME offline backend cannot look healthy in one
+    command and degraded in another. `shell` never calls an LLM, so any payload
+    it produces is evidence-free regardless of which skill wrapped it.
+
+    `verify` deliberately does NOT use this: it applies a patch and runs commands
+    rather than calling a model, so `--tool shell` cannot degrade it and tagging
+    it would be a false positive. Verify's evidence contract is
+    `resolution_status` (weak-pass = `patch_applied_only`).
+    """
+    degraded: List[str] = []
+    if tool_name == "shell":
+        degraded.append(
+            "shell_placeholder_backend: no LLM was called; this result contains "
+            "no analysis of the diff")
+    if report is not None:
+        if getattr(report, "exploration_degraded", ""):
+            degraded.append(f"exploration_degraded: {report.exploration_degraded}")
+        if getattr(report, "truncated_repair", False):
+            degraded.append("truncated_repair: JSON was only recoverable by dropping a "
+                            "truncated tail — findings after the cut are unknown")
+        if getattr(report, "parse_error", None):
+            degraded.append(f"parse_error: {report.parse_error}")
+    return degraded
+
+
+def _with_degraded(payload: Dict[str, Any], tool_name: str, report=None) -> Dict[str, Any]:
+    """Tag a result payload with its evidence-degradation reasons.
+
+    Applied by every skill that calls an LLM adapter: review, revise, generate.
+    Review and revise accept `--tool shell`, so tagging only one of them left the
+    same zero-evidence failure mode unlabelled in the others and forced the
+    downstream caller to reason per-command instead of reading one field.
+    Generate needs it too: `shell` yields an empty diff there (`ok=False`), which
+    says "no output" but not WHY.
+
+    Verify is deliberately excluded — it applies a patch and runs commands
+    rather than calling a model, so `--tool shell` cannot degrade it. Its
+    evidence contract is `VerificationResult.evidence_level` instead.
+    """
+    degraded = _degraded_reasons(tool_name, report)
+    if degraded:
+        payload["degraded"] = degraded
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +201,15 @@ class ReviewSkill:
         focus_files: Optional[List[str]] = None,
         prompt_style: Optional[str] = None,
         deep: bool = False,
+        repo_context: Optional[Dict[str, Any]] = None,
     ) -> SkillResult:
-        """deep=True 时返回论文 nested schema（decision:{recommendation,confidence}）"""
+        """deep=True 时返回论文 nested schema（decision:{recommendation,confidence}）
+
+        ``repo_context``: a caller that already ran the explorer for this exact
+        repo + issue (e.g. best_of_n's shared exploration) can hand the result in
+        so the reviewer does not re-explore once per candidate. Read-only reuse —
+        the explorer output contains no candidate-specific evidence.
+        """
         ctx = {
             "issue": issue,
             "pr_title": pr_title,
@@ -153,6 +220,8 @@ class ReviewSkill:
             "focus_files": focus_files or [],
             "prompt_style": prompt_style or self.prompt_style,
         }
+        if repo_context is not None:
+            ctx["repo_context"] = repo_context
         report: ReviewReport = await self.subagent.execute(ctx)
         # Deterministic grounding: verify/relocate finding locations against
         # the real workspace before serialization (no LLM cost).
@@ -167,7 +236,7 @@ class ReviewSkill:
             )
         return SkillResult(
             ok=(report.decision in DECISION_CHOICES and not report.parse_error),
-            payload=report.to_dict(deep=deep),
+            payload=_with_degraded(report.to_dict(deep=deep), _tool_name(self.tool), report),
             raw=report,
             message=f"reviewed (prompt_style={report.prompt_style}, deep={deep})"
                     + (f"; parse_error={report.parse_error}" if report.parse_error else ""),
@@ -225,7 +294,9 @@ class ReviseSkill:
         })
         return SkillResult(
             ok=(res.status in ("success", "partial")),
-            payload=res.to_dict(),
+            # Same degradation contract as review: a `--tool shell` revision is
+            # a structurally complete object with no revision behind it.
+            payload=_with_degraded(res.to_dict(), res.tool_name or _tool_name(self.tool)),
             raw=res,
             message=f"status={res.status}, feedback_level={res.feedback_level}"
         )
@@ -251,6 +322,13 @@ class VerifySkill:
         """注意 payload.ok 的语义：它表示**补丁是否成功应用**（`patch_applied`），
         不是"命令是否跑完"。工作区准备失败、补丁冲突都会给出 ok=False，而测试跑没跑、
         过没过要看 payload 里的 `resolution_status` / `test_results`。
+
+        Deliberately NOT tagged with `_with_degraded`: verify never calls an LLM
+        (it applies a patch and runs commands), so `--tool shell` has no effect
+        here and tagging it would be a false positive. Verify's own evidence
+        contract is `resolution_status`, whose weak-pass case
+        (`patch_applied_only`) the loop already surfaces via
+        `LoopResult.verification_status`.
         """
         res: VerificationResult = await self.subagent.execute({
             "pr_diff": pr_diff,
@@ -275,13 +353,31 @@ class GenerateSkill:
         self.explore_skill = explore_skill or ExploreSkill()
 
     async def explore(self, issue: str, repo_path: Optional[str] = None) -> Dict[str, Any]:
-        """Run the explorer once so a loop can share the result across N candidates."""
+        """Run the explorer once so a loop can share the result across N candidates.
+
+        An empty result is tagged with `exploration_degraded` so a caller (and
+        best_of_n's shared-exploration path) can tell "explored and found
+        nothing" from "could not explore". `ExploreSkill.execute` reports `ok`
+        for an empty payload, so without this tag the two were indistinguishable.
+        """
         if not repo_path:
-            return {}
+            return {"exploration_degraded":
+                    "explore_skipped: no repo_path supplied, so no repository "
+                    "evidence could be gathered"}
         ex = await self.explore_skill.execute(
             issue=issue, repo_path=repo_path, max_steps=4
         )
-        return ex.payload or {}
+        payload = ex.payload or {}
+        if payload.get("exploration_degraded"):
+            return payload
+        # Same predicate the loop uses for shared exploration — `keywords` is
+        # NOT evidence (it comes from the issue text and is always populated),
+        # only resolved files or a call chain are.
+        if not has_code_evidence(payload):
+            return {**payload, "exploration_degraded":
+                    "explore_empty: the explorer ran but resolved no files in the "
+                    "repository, so the candidate was written without code evidence"}
+        return payload
 
     async def execute(
         self,
@@ -305,7 +401,14 @@ class GenerateSkill:
             "perspective": perspective,
             "prior_failures": prior_failures,
         })
-        return SkillResult(ok=bool(res.diff), payload=res.to_dict(), raw=res)
+        # Same degradation contract as review/revise. `--tool shell` produces no
+        # usable diff here (its fixed payload has no `diff` key, so `_parse`
+        # returns an empty diff), which means `ok=False` — but an empty diff
+        # alone does not say WHY, and a caller comparing backends needs that.
+        return SkillResult(
+            ok=bool(res.diff),
+            payload=_with_degraded(res.to_dict(), _tool_name(self.tool)),
+            raw=res)
 
 
 # ---------------------------------------------------------------------------

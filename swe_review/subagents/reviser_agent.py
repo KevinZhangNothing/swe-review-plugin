@@ -17,6 +17,7 @@ from dataclasses import dataclass, asdict
 
 from .engineering_prompt import strip_fences
 from .diff_validation import validate_unified_diff
+from ..tools.base import accum_usage
 
 
 REVISION_FEEDBACK_LEVELS = ("full_feedback", "minimal_feedback", "baseline")
@@ -31,6 +32,13 @@ class RevisedPR:
     addressed_defect_indices: List[int]
     status: str  # "success" | "partial" | "failed"
     feedback_level: str = "full_feedback"  # which mode was used
+    # Revision cost was invisible in `LoopResult.token_usage_total` for the same
+    # reason as generation: only review usage was accumulated.
+    token_usage: Optional[Dict[str, int]] = None
+    # Adapter that actually produced this revision — carried on the RESULT, not
+    # read back off the skill's constructor field, so the degradation judgement
+    # has one source and cannot disagree with what really ran.
+    tool_name: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -235,8 +243,10 @@ class ReviserSubAgent:
         # loop. Every attempt re-sends the full prompt (the wasted call costs the
         # same as the retry), and the last attempt's result is kept either way.
         result: Optional[RevisedPR] = None
+        usage_total: Dict[str, int] = {}
         for attempt in range(1, self.max_regen_attempts + 1):
-            response, _ = await self._call_ai(system_prompt, user_prompt)
+            response, usage = await self._call_ai(system_prompt, user_prompt)
+            accum_usage(usage_total, usage)
             result = self._parse_response(response, original_title, original_body,
                                           feedback_level)
             if result.status != "failed":
@@ -244,6 +254,12 @@ class ReviserSubAgent:
             if attempt < self.max_regen_attempts:
                 await asyncio.sleep(self.regen_backoff_seconds * attempt)
         assert result is not None
+        # Every attempt costs a full-price call, so the regen budget must be
+        # visible in the cost report rather than showing only the last attempt.
+        result.token_usage = usage_total or None
+        # Stamp the adapter on the result so callers judge degradation from what
+        # produced the payload, not from a constructor field that could drift.
+        result.tool_name = str(getattr(self.tool_adapter, "name", "") or "")
         return result
 
     def _build_user_prompt_concise(self, issue, original_title, original_body,
