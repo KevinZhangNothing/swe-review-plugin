@@ -518,21 +518,26 @@ engineering 报告同时把 findings 映射为 legacy `defects`（P0/P1→high�
 
 三处落地，缺一不可：
 
-1. **静态证据层**（`detect_bloat_signals`，纯规则无 LLM）：`Patch Analysis` 输出 `bloat_signals`，五类信号分别对应一种叠加模式。
+1. **静态证据层**（`detect_bloat_signals`，纯规则无 LLM）：`Patch Analysis` 输出 `bloat_signals`，六类信号分别对应一种叠加模式。
 
    | 信号 | 触发条件 |
    |---|---|
-   | `additive_only_change` | **既有**文件新增 ≥8 行实质代码且删除 0 行 |
+   | `additive_only_change` | **既有**文件新增 ≥8 行实质代码且删除 0 行（单文件不达标时按跨文件合计判定） |
    | `flag_accumulation` | 新增 ≥2 个布尔型状态变量 |
    | `guard_stacking` | 新增 ≥3 个条件分支且**未**改写任何既有分支 |
-   | `compat_layer` | 新增 ≥2 处 fallback / legacy / workaround 标记 |
+   | `compat_layer` | 新增 ≥2 个**不同**的 fallback / legacy / workaround 机制 |
    | `wrapper_growth` | 既有文件中 ≤40 行的新增改动引入了新的顶层 def/class |
+   | `field_list_duplication` | 同一组 ≥2 个字段名同时出现在**声明处**与**映射处**，且分属两个文件 |
 
    阈值一律设在 1 以上：**新增一个必要变量或一个 guard 属于正常工程，不予报告**。信号是线索而非结论，判定不成立时须说明理由后驳回。
 
-   散文不算代码：注释、docstring/块字面量（含由**未改动上下文行**开启的 docstring）、prompt 字符串字面量、仅命名概念的符号定义行，以及非代码文件（`*.md` / `*.toml` / `*.yaml` 等）都不参与信号匹配。每一条排除都对应一个在自审中实测到的误报——用新检测器审它自己的源码时，这些误报被逐一发现并钉进回归测试。
+   `field_list_duplication` 与其余五类性质不同——它不是逐行模式。新增模型字段 `final bool stereoCharging;` 与映射项 `'stereoCharging': o.stereoCharging,` 是**不同文本**，整行重复检测看不见它们，任何行级模式也无法判断这是同一事实写了两遍。因此判定改用**键集合重合**：只有同一组 ≥2 个字段名在声明侧与映射侧同时出现、且分属两个文件时才触发。这种共现才意味着清单被复制——下一个字段必须两处都改，否则它会静默停止往返序列化，**既不报编译错误，往往也没有测试覆盖**。
 
-2. **评审提示契约**：system prompt 新增「Anti-Bloat / Patch-Stacking Deep Check」专项段，内置**修改策略优先级**（改现有逻辑 > 复用已有 > 简化结构 > 加一个变量 > 加多个状态 > 新增并行逻辑）、逐项反模式清单（Flag 堆积 / 分支叠加 / 只加不删 / 兼容层滥用 / 包装层增殖 / 中间变量冗余），并把「系统性臃肿」定义为可触发 Hard Gate 的 Severe Maintainability Problem。评审流程由 21 步扩为 22 步，反臃肿检查是独立一环。
+   刻意保守：只加一个新结构体的多个字段（无映射）不报；同文件内的 `fromMap`（合理共存）不报；键名被重命名（`providerId` → `provider_id`）因无同名交集而**保持沉默**——这是文字层的已知边界，已在提示词中写明，由模型在 context 中自行核查，而不是让静态层去猜。
+
+   散文不算代码：注释、docstring/块字面量（含由**未改动上下文行**开启的 docstring，以及多行函数签名的收尾行）、prompt 字符串字面量、仅命名概念的符号定义行，以及非代码文件（`*.md` / `*.toml` / `*.yaml` 等）与测试文件都不参与信号匹配。每一条排除都对应一个在自审中实测到的误报——用新检测器审它自己的源码时，这些误报被逐一发现并钉进回归测试。
+
+2. **评审提示契约**：system prompt 新增「Anti-Bloat / Patch-Stacking Deep Check」专项段，内置**修改策略优先级**（改现有逻辑 > 复用已有 > 简化结构 > 加一个变量 > 加多个状态 > 新增并行逻辑）、逐项反模式清单（Flag 堆积 / 分支叠加 / 只加不删 / 兼容层滥用 / 包装层增殖 / 中间变量冗余 / **字段对象膨胀** / **字段清单多处维护**），并把「系统性臃肿」定义为可触发 Hard Gate 的 Severe Maintainability Problem。评审流程由 21 步扩为 22 步，反臃肿检查是独立一环。
 
 3. **必填定量自查**：输出契约新增 `complexity_delta`（`new_state_vars` / `new_functions` / `derivable_state` / `removable_old_code` / `net_complexity`），回答「新增了几个变量、几个方法、有无可推导的新变量、有无可直接删除的旧代码、整体变复杂了吗」。`net_complexity: increased` 却没有任何对应 finding 或 action，视为无证据支撑的评分。
 

@@ -636,3 +636,199 @@ def test_small_additive_change_is_not_reported():
             "+    a = 1\n"
             "+    b = 2\n")
     assert "additive_only_change" not in kinds(diff)
+
+
+# ---------------------------------------------------------------------------
+# Field-list duplication — the "same field list in N places" defect
+# ---------------------------------------------------------------------------
+# The five line-pattern signals cannot see this. A new model field and the
+# mapper entry that serializes it are DIFFERENT text, so identical-line
+# detection finds nothing, and no per-line pattern knows that
+# `final bool stereoCharging;` and `'stereoCharging': o.stereoCharging,` are one
+# fact written twice. When they drift, the field silently stops round-tripping:
+# no compile error, and often no test.
+
+from swe_review.subagents.analyzer_agent import (  # noqa: E402
+    _field_name, _map_key, detect_field_list_duplication,
+)
+
+
+def _field_signals(diff: str) -> list:
+    return [s for s in detect_bloat_signals(diff)
+            if s["kind"] == "field_list_duplication"]
+
+
+DART_FIELD_LIST_DIFF = '''diff --git a/model.dart b/model.dart
+@@ -1,4 +1,6 @@
+ class Order {
+   final String id;
++  final bool stereoCharging;
++  final String providerId;
+   final int amount;
+ }
+diff --git a/mapper.dart b/mapper.dart
+@@ -1,4 +1,6 @@
+ Map<String, dynamic> toMap(Order o) => {
+   'id': o.id,
++  'stereoCharging': o.stereoCharging,
++  'providerId': o.providerId,
+   'amount': o.amount,
+ };
+'''
+
+
+def test_field_list_duplication_detected():
+    """Declaration and mapper key sets overlap -> the list is maintained twice."""
+    sig = _field_signals(DART_FIELD_LIST_DIFF)
+    assert sig, "a field list duplicated across model and mapper must be reported"
+    assert sig[0]["count"] == 2
+    assert set(sig[0]["files"]) == {"model.dart", "mapper.dart"}
+    joined = " ".join(sig[0]["evidence"])
+    assert "stereoCharging" in joined and "providerId" in joined
+    # The note must say WHY it matters, not just that something happened.
+    assert "静默回归" in sig[0]["note"]
+
+
+def test_field_list_duplication_python_annotated_fields():
+    """Python declares `name: type` — the reverse order of `final T name;`.
+
+    Regression: the first pass only understood type-first declarations, so
+    dataclass/pydantic models produced no declarations at all and the signal
+    could never fire on Python code.
+    """
+    diff = '''diff --git a/models.py b/models.py
+@@ -1,3 +1,5 @@
+ class Order:
+     id: str
++    stereo_charging: bool
++    provider_id: str
+diff --git a/serde.py b/serde.py
+@@ -1,3 +1,5 @@
+ def to_dict(o):
+     return {
++        'stereo_charging': o.stereo_charging,
++        'provider_id': o.provider_id,
+     }
+'''
+    sig = _field_signals(diff)
+    assert sig and sig[0]["count"] == 2
+
+
+def test_new_struct_alone_is_not_field_list_duplication():
+    """Two new fields on ONE struct is ordinary work, not a duplicated list."""
+    diff = '''diff --git a/model.dart b/model.dart
+@@ -1,2 +1,4 @@
+ class Address {
++  final String city;
++  final String zip;
+ }
+'''
+    assert _field_signals(diff) == []
+
+
+def test_colocated_dto_is_not_field_list_duplication():
+    """A fromMap next to its own class is a normal DTO, not a duplicated list.
+
+    Requiring two DIFFERENT files is what keeps this quiet; same-file pairs are
+    far more often legitimate co-location.
+    """
+    diff = '''diff --git a/dto.dart b/dto.dart
+@@ -1,2 +1,7 @@
+ class Dto {
++  final String city;
++  final String zip;
++  Map toMap() => {
++    'city': city,
++    'zip': zip,
++  };
+ }
+'''
+    assert _field_signals(diff) == []
+
+
+def test_renamed_keys_are_a_known_blind_spot():
+    """`providerId` -> `provider_id` shares no exact name; the text layer cannot
+    connect them. Silence is the correct behaviour here: a type-aware check
+    would need real symbol resolution, and guessing would be worse than
+    reporting nothing."""
+    diff = '''diff --git a/model.dart b/model.dart
+@@ -1,2 +1,4 @@
+ class Order {
++  final String providerId;
++  final bool stereoCharging;
+ }
+diff --git a/mapper.dart b/mapper.dart
+@@ -1,2 +1,4 @@
+ Map toMap(o) {
++  'provider_id': o.providerId,
++  'stereo_charging': o.stereoCharging,
+ }
+'''
+    assert _field_signals(diff) == []
+
+
+def test_field_name_parsing_shapes():
+    """Pin the accepted declaration shapes; each one is a real codebase form."""
+    assert _field_name("  final bool stereoCharging;") == "stereoCharging"
+    assert _field_name("  int? count,") == "count"
+    assert _field_name("    stereo_charging: bool") == "stereo_charging"
+    assert _field_name("    provider_id: str = ''") == "provider_id"
+    assert _field_name("    readonly x: number,") == "x"
+    # NOT fields: assignments, control flow, dict literals, prose.
+    assert _field_name("    self.foo = 1") == ""
+    assert _field_name("    if x: y") == ""
+    assert _field_name("        return count") == ""
+    assert _field_name("  'id': o.id,") == ""
+
+
+def test_map_key_parsing_shapes():
+    assert _map_key("  'stereoCharging': o.stereoCharging,") == "stereoCharging"
+    assert _map_key('  "providerId": id,') == "providerId"
+    assert _map_key("  stereoCharging: value,") == "stereoCharging"
+    assert _map_key("  if x: y") == ""
+    assert _map_key("  return charge(o)") == ""
+
+
+def test_multiline_signature_does_not_close_new_def_scope():
+    """A multi-line signature ends with `)` at indent 0, which is NOT a new
+    statement — the def's scope continues.
+
+    Regression, found by running this detector against its own addition: the
+    closer line reset `in_new_def`, so every guard inside the new function was
+    counted as stacking onto existing code (guard_stacking fired on the detector
+    itself for the second time, in a new way).
+    """
+    diff = (
+        "diff --git a/n.py b/n.py\n@@ -1,3 +1,14 @@\n def f(x):\n"
+        "+def helper(\n"
+        "+    a,\n"
+        "+    b,\n"
+        "+) -> int:\n"
+        "+    if a:\n"
+        "+        return 1\n"
+        "+    if b:\n"
+        "+        return 2\n"
+        "+    if a and b:\n"
+        "+        return 3\n"
+        "+    return 0\n"
+        "     return x\n"
+    )
+    assert "guard_stacking" not in kinds(diff)
+
+
+def test_field_list_signal_reaches_reviewer_patch_analysis():
+    """Evidence the reviewer never receives cannot influence a review."""
+    sub = ReviewerSubAgent(tool_adapter=None)
+    analysis = sub._analyze_patch(
+        DART_FIELD_LIST_DIFF, {"files_modified": ["model.dart", "mapper.dart"]})
+    assert any(s["kind"] == "field_list_duplication"
+               for s in analysis["bloat_signals"])
+
+
+def test_prompt_covers_field_growth_and_duplicated_lists():
+    sp = engineering_prompt.system_prompt(["Python"])
+    assert "字段/状态对象膨胀" in sp
+    assert "字段清单多处维护" in sp
+    assert "field_list_duplication" in sp
+    # The self-check must ask the question that would have caught it.
+    assert "新增字段是否需要在另一处清单同步修改" in sp

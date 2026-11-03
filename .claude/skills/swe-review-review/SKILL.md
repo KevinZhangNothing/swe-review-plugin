@@ -161,6 +161,23 @@ array computed statically (no LLM) by `detect_bloat_signals`:
 | `guard_stacking` | ≥3 added conditionals with **no** conditional removed |
 | `compat_layer` | ≥2 added fallback/legacy/workaround markers |
 | `wrapper_growth` | a ≤40-line additive change to an existing file adds a new top-level def/class |
+| `field_list_duplication` | ≥2 field names appear BOTH as declarations and as mapping keys, in different files |
+
+`field_list_duplication` is a different kind of check from the five above: it is
+not a per-line pattern. A new model field (`final bool stereoCharging;`) and the
+mapper entry that serializes it (`'stereoCharging': o.stereoCharging,`) are
+different text, so identical-line detection sees nothing and no line pattern
+knows they are one fact written twice. The judge is therefore set overlap: it
+fires only when the same set of ≥2 field names is added on both the declaration
+side and the mapping side, in two different files. That co-occurrence is what
+makes the list duplicated — the next field must be remembered in both places or
+it silently stops round-tripping, with no compile error and often no test.
+
+Deliberately conservative: one new struct with several fields and no mapper
+produces nothing; a co-located `fromMap` in the same file produces nothing; and
+renamed keys (`providerId` → `provider_id`) share no exact name, so the text
+layer stays silent rather than guessing. That last one is a known limit, stated
+in the prompt so the model checks it in context instead of trusting the signal.
 
 Thresholds sit deliberately above one: a single necessary variable or guard is ordinary
 engineering and is never reported. Signals are **evidence, not verdicts** — a signal the

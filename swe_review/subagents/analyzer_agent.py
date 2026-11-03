@@ -207,6 +207,13 @@ _LITERAL_LINE_RE = re.compile(r"""^[ \t]*(?:[rbuf]{0,2})(?:["']|\"\"\"|''')""")
 _NEW_FILE_HUNK_RE = re.compile(r"^@@ -0,0 ")
 _TOP_LEVEL_DEF_RE = re.compile(r"^(?:async[ \t]+)?(?:def|class)[ \t]+([A-Za-z_][A-Za-z0-9_]*)")
 
+#: The closing/continuation lines of a multi-line def signature: `) -> R:`,
+#: `):`, `) {`, or a bare `)` , plus the parameter lines themselves.
+_SIGNATURE_CONTINUATION_RE = re.compile(
+    r"^[ \t]*\)[ \t]*(?:->[ \t]*[^:]+)?[ \t]*:?[ \t]*\{?[ \t]*$"
+    r"|^[ \t]*(?:async[ \t]+)?(?:def|class)[ \t]+\S*\([ \t]*$"
+)
+
 _TRIPLE_QUOTES = ('"""', "'''")
 
 
@@ -258,6 +265,169 @@ def _effective_added(text: str) -> bool:
     if not stripped or _STRUCTURAL_ONLY_RE.match(text):
         return False
     return len(stripped) >= 4
+
+
+# ---------------------------------------------------------------------------
+# Field-list duplication — the "same field list maintained in N places" defect
+# ---------------------------------------------------------------------------
+# Why this needs its own mechanism: the five line-pattern signals above are
+# blind to it. A new model field and the mapper entry that serializes it are
+# DIFFERENT text, so `detect_repeated_added_blocks` (which requires identical
+# lines) sees nothing, and no per-line pattern can tell that
+# `final bool stereoCharging;` and `'stereoCharging': o.stereoCharging,` are the
+# same fact written twice. When they drift, a field silently stops being
+# serialized — a regression with no compile error and often no test.
+#
+# The judgement is deliberately NOT "did >=2 fields get added": adding two
+# fields to ONE new struct is ordinary work. It is "is the same SET of field
+# names declared in one place and enumerated in another" — i.e. the list is
+# duplicated, so a future field addition must be remembered in both.
+
+#: A field DECLARATION: `final bool stereoCharging;`, `int? count,`,
+#: `private String id = "";`, `public int Age { get; set; }`.
+#: Group 1 = field name. Ordered so `final`/`required` modifiers cannot be
+#: mistaken for the type.
+_FIELD_DECL_RE = re.compile(
+    r"^[ \t]*(?:@\w+(?:\([^)]*\))?[ \t]*)*"
+    r"(?:(?:public|private|protected|internal|static|final|readonly|const"
+    r"|late|required|mutable|var|val|let)[ \t]+)*"
+    r"([A-Za-z_][\w<>,\.\]\?\[\] ]*?)[ \t]+"
+    r"([A-Za-z_]\w*)[ \t]*(?:=[^;]*)?[;,][ \t]*$"
+)
+
+#: A map/serialization KEY: `'stereoCharging': o.stereoCharging,`,
+#: `"providerId": id,`, `stereoCharging: value,` (JS/YAML-ish).
+_MAP_KEY_RE = re.compile(
+    r"""^[ \t]*(?:['"]([A-Za-z_]\w*)['"]|([A-Za-z_]\w*))[ \t]*:[ \t]*\S"""
+)
+
+#: An ANNOTATED field: `stereo_charging: bool`, `provider_id: str = ""`.
+#: Covers Python (dataclass/pydantic/TypedDict), TypeScript `readonly x: T`,
+#: and Kotlin `val x: T`. Needed as a SEPARATE pattern because the name/type
+#: order is reversed relative to `final bool x;` and the line need not end in
+#: `;` or `,` — the shape that made Python models invisible to the first pass.
+_ANNOTATED_FIELD_RE = re.compile(
+    r"^[ \t]*(?:(?:readonly|public|private|protected|final|late)[ \t]+)*"
+    r"([A-Za-z_]\w*)[ \t]*:[ \t]*"
+    r"([A-Za-z_][\w<>\[\]\.\, \|\?]*)"
+    r"(?:[ \t]*=[ \t]*.*)?$"
+)
+
+#: Keywords whose "declaration" shape is not a field (`if x: y`, `case a: b`).
+_NOT_A_FIELD_RE = re.compile(
+    r"^(?:if|elif|else|for|while|return|case|switch|when|match|import|from"
+    r"|class|def|function|type|interface|enum|namespace|using|export)$"
+)
+
+
+def _field_name(text: str) -> str:
+    """Field name from a declaration line, or "" when it is not one."""
+    # `final bool x;` / `int? count,` (type-first)
+    m = _FIELD_DECL_RE.match(text)
+    if m:
+        name = m.group(2)
+        if _NOT_A_FIELD_RE.match(name) or " " in name or not name.isidentifier():
+            return ""
+        return name
+    # `x: bool` (name-first, annotated)
+    m = _ANNOTATED_FIELD_RE.match(text)
+    if m:
+        name = m.group(1)
+        # A bare `key: value,` inside a dict literal matches this shape too, so
+        # the value must look like a TYPE, never like a reference (`.`/`(`).
+        type_part = m.group(2).strip()
+        if (_NOT_A_FIELD_RE.match(name) or not name.isidentifier()
+                or not type_part or type_part[0] in "'\""
+                or "." in type_part.split("[")[0].replace("Self", "")
+                or "(" in type_part):
+            return ""
+        return name
+    return ""
+
+
+def _map_key(text: str) -> str:
+    """Serialization key from a `'key': value` line, or "" when not one."""
+    m = _MAP_KEY_RE.match(text)
+    if not m:
+        return ""
+    key = m.group(1) or m.group(2)
+    if _NOT_A_FIELD_RE.match(key):
+        return ""
+    return key
+
+
+def detect_field_list_duplication(
+    pr_diff: str, min_shared: int = 2
+) -> List[Dict[str, Any]]:
+    """Report when the same field-name set is declared AND enumerated elsewhere.
+
+    Fires only when an added field DECLARATION and an added serialization KEY
+    share >= `min_shared` names across two different files. That co-occurrence
+    is what makes the list duplicated: the field must now be added in both
+    places or it silently stops round-tripping.
+
+    Deliberately conservative:
+    - One new struct with several fields and no map counterpart produces no
+      signal (nothing is duplicated).
+    - A mapper that renames keys (`providerId` -> `provider_id`) shares no
+      exact name and produces no signal. That is a KNOWN LIMIT of a
+      text-level check — see the module note; a type-aware check would need
+      real symbol resolution. Staying silent beats a wrong claim.
+    """
+    decls: Dict[str, Dict[str, set]] = {}   # file -> {name -> set of lines}
+    maps: Dict[str, Dict[str, set]] = {}
+
+    current_file = ""
+    for line in (pr_diff or "").split("\n"):
+        if line.startswith("diff --git"):
+            parts = line.split()
+            current_file = (
+                parts[2].removeprefix("a/").removeprefix("b/")
+                if len(parts) >= 3 else ""
+            )
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        if not current_file or not _is_code_path(current_file):
+            continue
+        text = line[1:]
+
+        name = _field_name(text)
+        if name:
+            decls.setdefault(current_file, {}).setdefault(name, set()).add(text.strip())
+            continue
+
+        key = _map_key(text)
+        if key:
+            maps.setdefault(current_file, {}).setdefault(key, set()).add(text.strip())
+
+    if not decls or not maps:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for dfile, dnames in decls.items():
+        for mfile, mnames in maps.items():
+            if dfile == mfile:
+                # Same file (e.g. a fromMap next to the class) is far more often
+                # a legitimate co-located DTO than a duplicated list across the
+                # codebase; requiring two files keeps the signal specific.
+                continue
+            shared = sorted(set(dnames) & set(mnames))
+            if len(shared) < min_shared:
+                continue
+            out.append({
+                "kind": "field_list_duplication",
+                "count": len(shared),
+                "files": [dfile, mfile],
+                "evidence": [f"{dfile}: {sorted(dnames)[0]} (declaration)",
+                             f"{mfile}: {sorted(mnames)[0]} (mapping)",
+                             f"shared fields: {', '.join(shared[:6])}"],
+                "note": ("同一组字段在『声明处』与『映射处』各维护一份；"
+                         "新增字段时必须两处同步，漏一处即是静默回归"
+                         "（字段不再被序列化/反序列化）。确认能否由单一清单驱动。"),
+            })
+            break  # one declaration/mapping pair is enough per declaration file
+    return out
 
 
 #: Files whose diff content is prose/config, not executable logic. Bloat signals
@@ -397,11 +567,23 @@ def detect_bloat_signals(pr_diff: str, cap_per_kind: int = 6) -> List[Dict[str, 
 
             # Enter/leave the body of a function or class this diff CREATES. A blank line
             # never closes the scope (see in_new_def); a non-blank line dedented back
-            # to or past the def does.
+            # to or past the def does — EXCEPT a continuation of that def's own
+            # signature, which is what a multi-line parameter list looks like:
+            #     def f(
+            #         a, b,
+            #     ) -> R:            <- indent 0, but still the same def
+            # Treating the closer as a new statement ended the scope there, so
+            # every guard in the new function was reported as stacking onto
+            # existing code — seen when this very detector was added.
             indent = _indent_of(text)
+            continues_signature = bool(
+                _SIGNATURE_CONTINUATION_RE.match(text)
+                or (in_new_def and body.rstrip().endswith((",", "(")))
+            )
             if _TOP_LEVEL_DEF_RE.match(text):
                 new_def_indent, in_new_def = indent, True
-            elif in_new_def and body and indent <= new_def_indent:
+            elif (in_new_def and body and indent <= new_def_indent
+                  and not continues_signature):
                 new_def_indent, in_new_def = None, False
 
             if _CONDITION_RE.match(text):
@@ -488,6 +670,11 @@ def detect_bloat_signals(pr_diff: str, cap_per_kind: int = 6) -> List[Dict[str, 
         _add("wrapper_growth", len(wrappers), [w["file"] for w in wrappers],
              [f"{w['file']}: {w['name']}" for w in wrappers],
              "小改动引入了新的顶层抽象；确认是否可复用已有实现、或写成内联逻辑。")
+
+    # 6) The same field list declared in one place and enumerated in another.
+    # Needs its own scan (declaration-vs-mapping key co-occurrence), so it is
+    # appended rather than woven into the per-line loop above.
+    out.extend(detect_field_list_duplication(pr_diff))
 
     return out
 
