@@ -49,6 +49,19 @@ def accum_usage(total: Dict[str, int], add: Optional[Dict[str, int]]) -> None:
 
 
 class BaseAdapter:
+    """Contract every tool adapter implements.
+
+    Deliberately NOT an ``abc.ABC``: `Skill` falls back to ``BaseAdapter()`` as a
+    no-tool stand-in (returning ``("{}", {})`` rather than raising), so the class
+    must stay instantiable. Subclassing is still required by convention and
+    pinned by ``tests/test_tools_base.py::test_every_adapter_subclasses_base`` —
+    the type relationship is what lets ``isinstance`` checks and the registry
+    agree, and a plain duck-typed class silently drifts when a method is renamed.
+
+    ``diagnose`` is OPTIONAL: it exists on the real CLI adapters for
+    ``swe-review list-tools`` diagnostics and is not part of this contract.
+    """
+
     name: str = "base"
 
     async def chat(

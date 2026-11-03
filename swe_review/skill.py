@@ -22,6 +22,7 @@ from .subagents.generator_agent import GeneratorSubAgent, GeneratedPR
 from .subagents.loop_agent import LoopSubAgent, LoopResult, has_code_evidence
 # stdlib-only module, so a top-level import carries no cycle risk
 from .subagents.location_grounding import ground_report_locations, unverified_high_severity
+from .tools.base import BaseAdapter
 from .subagents.diff_sharding import (
     DEFAULT_SHARD_BUDGET_CHARS,
     DEFAULT_SHARD_CONCURRENCY,
@@ -174,7 +175,6 @@ class ReviewSkill:
                  shard_large_diffs: bool = True,
                  shard_budget_chars: int = DEFAULT_SHARD_BUDGET_CHARS,
                  shard_concurrency: int = DEFAULT_SHARD_CONCURRENCY):
-        from .tools.base import BaseAdapter
         self.tool = tool_adapter or BaseAdapter()
         self.explore_skill = explore_skill or ExploreSkill()
         self.analyze_skill = analyze_skill or AnalyzeSkill()
@@ -260,7 +260,6 @@ class ReviseSkill:
     def __init__(self, tool_adapter=None, prompt_style: str = "concise",
                  feedback_level: str = "full_feedback",
                  max_regen_attempts: int = 2):
-        from .tools.base import BaseAdapter
         self.tool = tool_adapter or BaseAdapter()
         self.prompt_style = prompt_style
         self.feedback_level = feedback_level
@@ -347,7 +346,6 @@ class GenerateSkill:
     name = "generate"
 
     def __init__(self, tool_adapter=None, explore_skill: Optional[ExploreSkill] = None):
-        from .tools.base import BaseAdapter
         self.tool = tool_adapter or BaseAdapter()
         self.subagent = GeneratorSubAgent(tool_adapter=self.tool)
         self.explore_skill = explore_skill or ExploreSkill()

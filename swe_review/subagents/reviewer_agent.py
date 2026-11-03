@@ -46,6 +46,7 @@ from .diff_sharding import (
 from .engineering_prompt import parse_diff_files, strip_fences, truncate_json_text
 from ..tools.base import accum_usage
 from ..tools.host_adapter import HostTurnRequired
+from ._protocol import raise_protocol_signals
 
 
 # Defect severity & category enumerations
@@ -69,17 +70,10 @@ DECISION_APPROVING = ("approve", "approve_with_suggestions")
 DECISION_REJECTING = ("request_changes", "block")
 DECISION_CHOICES = DECISION_APPROVING + DECISION_REJECTING
 
-# Engineering scoring dimensions and their max points (total = 100).
-SCORE_DIMENSIONS = {
-    "design_quality": 20,
-    "maintainability": 15,
-    "consistency": 15,
-    "simplicity": 10,
-    "readability": 10,
-    "testability": 10,
-    "risk": 10,
-    "change_scope": 10,
-}
+# Engineering scoring dimensions live in `engineering_prompt`, which renders them
+# into the output contract; re-exported here because callers (and tests) import
+# them from this module. One definition, two consumers — see the note there.
+SCORE_DIMENSIONS = engineering_prompt.SCORE_DIMENSIONS
 
 
 @dataclass
@@ -243,6 +237,13 @@ class ReviewReport:
     # indistinguishable from a repository-grounded one.
     exploration_degraded: str = ""
     prompt_style: str = "engineering"  # "engineering" | "concise" | "detailed"
+    #: How the verdict was produced. "single_call" is one model review;
+    #: "synthesis" is a model synthesis over shard findings; "deterministic"
+    #: means NO model took part in the verdict (synthesis failed and the scores /
+    #: decision were aggregated in code). Without this a scoreless deterministic
+    #: report was indistinguishable from a model review that simply omitted
+    #: scores, which is the difference between "reviewed" and "not reviewed".
+    aggregation_mode: str = "single_call"
     # Adapter that produced this report (e.g. "shell" = offline placeholder, no
     # LLM call was made). Lets the skill layer tag a report as degraded instead
     # of letting a structurally complete fake look like a real review.
@@ -310,6 +311,7 @@ class ReviewReport:
             "exploration_truncated": self.exploration_truncated,
             "exploration_degraded": self.exploration_degraded,
             "prompt_style": self.prompt_style,
+            "aggregation_mode": self.aggregation_mode,
             "tool_name": self.tool_name,
         }
 
@@ -335,6 +337,40 @@ def _safe_exc_summary(exc: BaseException) -> str:
     if len(detail) > _EXC_DETAIL_CHARS:
         detail = detail[:_EXC_DETAIL_CHARS] + "…(truncated)"
     return f"{name}: {detail}"
+
+
+#: Confidence ceilings applied when the evidence base was incomplete. The model
+#: reports how sure it is about the CODE, but it cannot see that the explorer hit
+#: MAX_RELATED_FILES or that it never ran at all — that knowledge lives in the
+#: harness. An unadjusted 0.95 built on a truncated caller graph reads as a
+#: well-grounded review when it is not.
+_CONF_CEILING_TRUNCATED = 0.75
+_CONF_CEILING_DEGRADED = 0.55
+
+
+def _cap_confidence_for_evidence(report: "ReviewReport") -> None:
+    """Lower `report.confidence` to reflect an incomplete evidence base.
+
+    Only ever lowers. Applied AFTER the model answered, because the model has no
+    way to know the explorer was clipped; likewise the ceiling is surfaced in the
+    report so a reader can see why the number is capped.
+    """
+    ceiling = None
+    if report.exploration_degraded:
+        # The explorer never produced repository context at all (timeout/raised):
+        # the review rests on the diff alone.
+        ceiling = _CONF_CEILING_DEGRADED
+    elif report.exploration_truncated:
+        ceiling = _CONF_CEILING_TRUNCATED
+    if ceiling is None or report.confidence is None:
+        return
+    if report.confidence <= ceiling:
+        return
+    report.summary = dict(report.summary or {})
+    report.summary["confidence_capped"] = (
+        f"{report.confidence:.2f} -> {ceiling:.2f} "
+        f"({'exploration degraded' if report.exploration_degraded else 'evidence truncated'})")
+    report.confidence = ceiling
 
 
 def _normalize_location_flat(loc: Any) -> str:
@@ -770,6 +806,7 @@ class ReviewerSubAgent:
         report.exploration_truncated = bool(repo_context.get("truncated"))
         report.exploration_degraded = str(repo_context.get("exploration_degraded") or "")
         report.tool_name = str(getattr(self.tool_adapter, "name", "") or "")
+        _cap_confidence_for_evidence(report)
         return report
 
     async def _review_once(
@@ -892,10 +929,21 @@ class ReviewerSubAgent:
                 return shard, rep, raw
 
         # One shard raising must not sink the whole review — same reasoning as
-        # best_of_n's `return_exceptions=True`.
+        # best_of_n's `return_exceptions=True`. BUT the protocol signal must not be
+        # folded in with real failures: `HostTurnRequired` means "a prompt is on
+        # disk and nobody answered it yet". Swallowing it here reported the run as
+        # `review_unparseable` and threw away the file names the caller needs to
+        # continue. loop_agent already learned this lesson (see
+        # `_is_protocol_signal`) and re-raises; the sharded review path is the
+        # second place the same `gather(return_exceptions=True)` shape appears and
+        # it was never given the same treatment.
         outcomes = await asyncio.gather(
             *[review_shard(s) for s in shards], return_exceptions=True
         )
+        # Shared rule with loop_agent's wave isolation (subagents/_protocol.py):
+        # an unanswered host prompt or a missing CLI binary must reach the caller
+        # instead of becoming "every shard failed".
+        raise_protocol_signals(outcomes)
 
         reports: List[ReviewReport] = []
         failed: List[str] = []
@@ -943,6 +991,9 @@ class ReviewerSubAgent:
         token_usage = _merge_token_usage(token_usage, synth_usage)
 
         base = synthesis or self._worst_case_report(reports)
+        if synthesis:
+            # Only the healthy path had a model assign scores/decision.
+            base.aggregation_mode = "synthesis"
         base.findings = merged_findings
         base.defects = [f.to_defect() for f in merged_findings]
         base.token_usage = token_usage
@@ -1061,6 +1112,9 @@ class ReviewerSubAgent:
             total_score=float(sum(total)) if total else None,
             hard_gate={"triggered": False, "reason": ""},
             prompt_style="engineering",
+            # No model contributed to this verdict — say so in a machine-readable
+            # field, not only in prose. Downstream can treat it as advisory.
+            aggregation_mode="deterministic",
         )
 
     # ------------------------------------------------------------------
@@ -1721,42 +1775,36 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
         sanity_problems.append("all findings lack observation/evidence")
     # Normalized once: both report shapes below carry it, and computing it at
     # each construction site duplicated the call verbatim.
-    #
-    # NOTE: the two ReviewReport(...) calls below still repeat ~10 identical
-    # fields, so `detect_repeated_added_blocks` reports this line. That is
-    # accepted, not overlooked: collapsing them would mean building an
-    # intermediate dict of 9 shared kwargs to hide a real difference (the sanity
-    # branch nulls total_score and sets parse_error). The signal is a lead, and
-    # this lead was checked and dismissed.
     complexity_delta = _normalize_complexity_delta(data.get("complexity_delta"))
-    if sanity_problems:
-        return ReviewReport(
-            decision=decision,
-            confidence=confidence,
-            summary=data.get("summary", {}) or {},
-            defects=defects,
-            findings=findings,
-            scores=scores,
-            total_score=None,
-            hard_gate=hard_gate,
-            complexity_delta=complexity_delta,
-            token_usage=token_usage,
-            prompt_style="engineering",
-            parse_error="incomplete_content: " + "; ".join(sanity_problems),
-        )
 
-    return ReviewReport(
+    # Shared shape, then the branch-specific deltas spelled out. Two full
+    # `ReviewReport(...)` calls repeated ten identical kwargs, which meant a new
+    # field had to be added twice and could silently land in only one branch.
+    # The differences are kept as an explicit override dict so nothing is hidden:
+    #   - the sanity branch nulls total_score and sets parse_error;
+    #   - only the healthy branch carries whats_good / recommended_actions.
+    report_kwargs = dict(
         decision=decision,
         confidence=confidence,
         summary=data.get("summary", {}) or {},
         defects=defects,
         findings=findings,
         scores=scores,
-        total_score=total_score,
         hard_gate=hard_gate,
         complexity_delta=complexity_delta,
-        whats_good=_str_list("whats_good"),
-        recommended_actions=_str_list("recommended_actions"),
         token_usage=token_usage,
         prompt_style="engineering",
+    )
+    if sanity_problems:
+        return ReviewReport(
+            total_score=None,
+            parse_error="incomplete_content: " + "; ".join(sanity_problems),
+            **report_kwargs,
+        )
+
+    return ReviewReport(
+        total_score=total_score,
+        whats_good=_str_list("whats_good"),
+        recommended_actions=_str_list("recommended_actions"),
+        **report_kwargs,
     )

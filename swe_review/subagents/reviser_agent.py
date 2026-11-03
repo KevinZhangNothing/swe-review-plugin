@@ -323,6 +323,11 @@ class ReviserSubAgent:
             # twice in self-runs.) Returning an empty diff here lets the regen
             # budget retry, and if it never succeeds the loop stops with an honest
             # "revise produced no usable diff" instead of a late verify failure.
+            #
+            # SCOPE: hunk arithmetic only — necessary but not sufficient. A diff
+            # that passes here can still fail `git apply` (context mismatch,
+            # missing target, path escape), so """" means "not obviously
+            # corrupt", not "applicable". VerifierSubAgent decides that.
             shape_problem = validate_unified_diff(diff) if diff.strip() else ""
             if shape_problem:
                 return RevisedPR(

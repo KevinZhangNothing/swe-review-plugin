@@ -14,7 +14,7 @@ import shutil
 from typing import Dict, Any, Optional, Tuple
 
 from ._pty_runner import run_in_pty, strip_ansi, strip_fences, extract_tokens_from_text
-from .base import MODEL_INHERITED_NOTE
+from .base import BaseAdapter, MODEL_INHERITED_NOTE
 
 
 def _find_cli() -> str:
@@ -27,7 +27,7 @@ def _find_cli() -> str:
     )
 
 
-class CursorAdapter:
+class CursorAdapter(BaseAdapter):
     name = "cursor"
 
     def __init__(

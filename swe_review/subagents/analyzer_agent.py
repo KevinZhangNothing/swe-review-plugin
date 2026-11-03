@@ -457,27 +457,14 @@ def _is_code_path(path: str) -> bool:
     return not (_NON_CODE_PATH_RE.search(path) or _TEST_PATH_RE.search(path))
 
 
-def detect_bloat_signals(pr_diff: str, cap_per_kind: int = 6) -> List[Dict[str, Any]]:
-    """Return static anti-bloat signals found in a unified diff.
+def _scan_diff_signals(pr_diff: str) -> Dict[str, Any]:
+    """Phase 1 — walk the diff once and collect raw per-line evidence.
 
-    Each entry is evidence, shaped for the reviewer's Patch Analysis:
-      {"kind", "count", "files", "evidence", "note"}
-
-    Kinds (all thresholds deliberately above one — a single variable or guard is
-    normal engineering and must not be reported):
-
-    - ``additive_only_change`` — an EXISTING file gained >= 8 real lines and lost
-      none. The signature of "solve it by adding, never by adjusting".
-    - ``flag_accumulation``   — >= 2 new boolean-ish state variables. Two flags
-      for one local feature is the "one more bool to control it" spiral.
-    - ``guard_stacking``      — >= 3 added conditionals with no conditional
-      removed. Branches pile up instead of the existing branch being rewritten.
-    - ``compat_layer``        — >= 2 added compatibility/safety-net markers
-      (fallback / legacy / workaround …) layered on old logic.
-    - ``wrapper_growth``      — a small additive change to an EXISTING file that
-      introduces a new top-level def/class. "Simple need → new manager".
-
-    Empty list means no signal — never a statement that the change is clean.
+    Split out of `detect_bloat_signals`, which carried both phases (scan +
+    threshold) in ~160 lines of mixed state. They answer different questions:
+    this one is "what did the diff literally contain", the aggregator is
+    "which of those clears a threshold". Separating them is what makes the
+    thresholds reviewable without first reading the parser.
     """
     flags: List[Dict[str, str]] = []
     compat: List[Dict[str, str]] = []
@@ -608,6 +595,46 @@ def detect_bloat_signals(pr_diff: str, cap_per_kind: int = 6) -> List[Dict[str, 
                 stats["del"] += 1
             if _CONDITION_RE.match(text):
                 guard_removed += 1
+
+    return {
+        "flags": flags,
+        "compat": compat,
+        "wrappers": wrappers,
+        "guard_added": guard_added,
+        "guard_removed": guard_removed,
+        "per_file": per_file,
+    }
+
+
+def detect_bloat_signals(pr_diff: str, cap_per_kind: int = 6) -> List[Dict[str, Any]]:
+    """Return static anti-bloat signals found in a unified diff.
+
+    Each entry is evidence, shaped for the reviewer's Patch Analysis:
+      {"kind", "count", "files", "evidence", "note"}
+
+    Kinds (all thresholds deliberately above one — a single variable or guard is
+    normal engineering and must not be reported):
+
+    - ``additive_only_change`` — an EXISTING file gained >= 8 real lines and lost
+      none. The signature of "solve it by adding, never by adjusting".
+    - ``flag_accumulation``   — >= 2 new boolean-ish state variables. Two flags
+      for one local feature is the "one more bool to control it" spiral.
+    - ``guard_stacking``      — >= 3 added conditionals with no conditional
+      removed. Branches pile up instead of the existing branch being rewritten.
+    - ``compat_layer``        — >= 2 added compatibility/safety-net markers
+      (fallback / legacy / workaround …) layered on old logic.
+    - ``wrapper_growth``      — a small additive change to an EXISTING file that
+      introduces a new top-level def/class. "Simple need → new manager".
+
+    Empty list means no signal — never a statement that the change is clean.
+    """
+    scanned = _scan_diff_signals(pr_diff)
+    flags = scanned["flags"]
+    compat = scanned["compat"]
+    wrappers = scanned["wrappers"]
+    guard_added = scanned["guard_added"]
+    guard_removed = scanned["guard_removed"]
+    per_file = scanned["per_file"]
 
     out: List[Dict[str, Any]] = []
 

@@ -21,28 +21,9 @@ from pathlib import Path
 from .reviewer_agent import DECISION_APPROVING
 from ..tools.decisions import choose_revision_action, findings_digest
 from ..tools.base import accum_usage
-from ..tools.host_adapter import HostTurnRequired
-
-
-def _is_protocol_signal(exc: BaseException) -> bool:
-    """True for exceptions that must NEVER be swallowed by error isolation.
-
-    ``HostTurnRequired`` is a *control signal*, not a failure: under ``--tool
-    host`` it means "a prompt is on disk and nobody has answered it yet". The
-    concurrent waves below use ``asyncio.gather(return_exceptions=True)`` so one
-    bad candidate cannot sink a batch — but that also converted this signal into
-    an empty candidate, so `best_of_n` printed "no candidate approved+verified"
-    and exited 0 while two unanswered prompts sat in the rendezvous dir. The
-    caller could never learn what to do next.
-    """
-    return isinstance(exc, HostTurnRequired)
-
-
-def _raise_protocol_signals(results: List[Any]) -> None:
-    """Re-raise the first protocol signal found in a `gather` result list."""
-    for r in results:
-        if isinstance(r, BaseException) and _is_protocol_signal(r):
-            raise r
+from ..tools.host_adapter import HostTurnRequired  # noqa: F401  (re-exported)
+from ._protocol import is_protocol_signal as _is_protocol_signal
+from ._protocol import raise_protocol_signals as _raise_protocol_signals
 
 
 def has_code_evidence(exploration: Any) -> bool:

@@ -31,6 +31,44 @@ LANGUAGE_CHECKS: Dict[str, str] = {
 }
 _FALLBACK_LANGUAGE_CHECK = "退回通用原则（正确性、清晰性、安全性）。"
 
+# Engineering scoring dimensions and their max points (total = 100).
+#
+# SINGLE SOURCE OF TRUTH, and it lives here on purpose: the output contract
+# below renders these numbers into the prompt, and `reviewer_agent` validates the
+# model's answer against them. Before this moved here, the dims were written out
+# twice — once as this dict, once as hand-written literals inside the prompt — so
+# changing a max in one place made the prompt ask for 0-20 while the parser
+# enforced 15. Nothing asserted they agreed; a whole-package self-review caught
+# it as the only P2.
+#
+# `reviewer_agent` re-exports the name, so existing importers are unaffected.
+SCORE_DIMENSIONS: Dict[str, int] = {
+    "design_quality": 20,
+    "maintainability": 15,
+    "consistency": 15,
+    "simplicity": 10,
+    "readability": 10,
+    "testability": 10,
+    "risk": 10,
+    "change_scope": 10,
+}
+
+
+def score_schema_lines(reasons: Dict[str, str] | None = None) -> str:
+    """Render the `scores` block of the output contract from SCORE_DIMENSIONS.
+
+    Generated rather than hand-written so the prompt and the parser can never
+    disagree about a dimension name or its maximum.
+    """
+    reasons = reasons or {}
+    rows = []
+    for i, (dim, maximum) in enumerate(SCORE_DIMENSIONS.items()):
+        reason = reasons.get(dim, "一句话，追溯到代码证据" if i == 0 else "一句话")
+        comma = "" if i == len(SCORE_DIMENSIONS) - 1 else ","
+        rows.append(f'    "{dim}":{{"score": 0-{maximum}, "max": {maximum}, '
+                    f'"reason": "{reason}"}}{comma}\n')
+    return "".join(rows)
+
 # SWE-Gate review-constraint taxonomy — single source of truth shared by the
 # output-contract text below and the parser in reviewer_agent (unknown values
 # normalize to ""). Keep the prompt list and this tuple in sync by construction.
@@ -479,15 +517,8 @@ def system_prompt(languages: Optional[Iterable[str]] = None) -> str:
         '  "whats_good": ["做得好的地方（0-3 条，需有依据）"],\n'
         '  "recommended_actions": ["按优先级排序的后续行动"],\n'
         '  "scores": {\n'
-        '    "design_quality":  {"score": 0-20, "max": 20, "reason": "一句话，追溯到代码证据"},\n'
-        '    "maintainability": {"score": 0-15, "max": 15, "reason": "一句话"},\n'
-        '    "consistency":     {"score": 0-15, "max": 15, "reason": "一句话"},\n'
-        '    "simplicity":      {"score": 0-10, "max": 10, "reason": "一句话"},\n'
-        '    "readability":     {"score": 0-10, "max": 10, "reason": "一句话"},\n'
-        '    "testability":     {"score": 0-10, "max": 10, "reason": "一句话"},\n'
-        '    "risk":            {"score": 0-10, "max": 10, "reason": "一句话"},\n'
-        '    "change_scope":    {"score": 0-10, "max": 10, "reason": "一句话"}\n'
-        "  },\n"
+        + score_schema_lines()
+        + "  },\n"
         '  "total_score": 0-100,\n'
         '  "hard_gate": {"triggered": bool, "reason": "触发原因，未触发则空串"}\n'
         "}\n\n"

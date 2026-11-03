@@ -189,6 +189,12 @@ class GeneratorSubAgent:
             # A generated diff with wrong hunk arithmetic gets APPROVED by review
             # (text only) and rejected by verify much later — the same failure the
             # reviser guards against. Drop the diff so it cannot propagate.
+            #
+            # SCOPE: this is a producer-side gate on hunk arithmetic only, NOT an
+            # applicability check. Passing it says the counts add up; `git apply`
+            # can still reject the diff on context mismatch, a missing target
+            # file, or a path escape. VerifierSubAgent remains the authority — do
+            # not treat "" here as "this patch will apply".
             shape_problem = validate_unified_diff(diff) if diff.strip() else ""
             if shape_problem:
                 diff, ok = "", False

@@ -19,7 +19,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
-from .base import MODEL_INHERITED_NOTE
+from .base import BaseAdapter, MODEL_INHERITED_NOTE
 
 from ._pty_runner import (
     run_subprocess, strip_ansi, strip_fences, extract_tokens_from_text,
@@ -47,7 +47,7 @@ def _find_cli() -> str:
     return shutil.which("opencode") or "opencode"
 
 
-class OpenCodeAdapter:
+class OpenCodeAdapter(BaseAdapter):
     name = "opencode"
 
     def __init__(

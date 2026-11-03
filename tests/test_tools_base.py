@@ -114,3 +114,87 @@ def test_rounding_is_approximate_not_equivalent_to_the_estimator():
     # Every disagreement is exactly one token — an accepted approximation.
     for value, round_value, floor_value in disagreements:
         assert abs(round_value - floor_value) == 1
+
+
+# ---------------------------------------------------------------------------
+# Adapter contract — every registered backend subclasses BaseAdapter
+# ---------------------------------------------------------------------------
+# Found by a whole-package self-review: all six adapters were independent classes
+# that merely happened to define `chat`/`get_status`. Nothing in the type system
+# said so, so a renamed method on one adapter would only surface at call time —
+# and `diagnose` was even less uniform (five adapters had it, ShellTools did not).
+#
+# BaseAdapter deliberately stays instantiable (Skill falls back to `BaseAdapter()`
+# as a no-tool stand-in), so this is a structural test rather than an ABC.
+
+def test_every_adapter_subclasses_base():
+    from swe_review.tools.base import BaseAdapter
+    from swe_review.tools.claude_code_adapter import ClaudeCodeAdapter
+    from swe_review.tools.cursor_adapter import CursorAdapter
+    from swe_review.tools.host_adapter import HostAdapter
+    from swe_review.tools.opencode_adapter import OpenCodeAdapter
+    from swe_review.tools.pi_adapter import PiAdapter
+    from swe_review.tools.shell_tools import ShellTools
+
+    adapters = (ClaudeCodeAdapter, CursorAdapter, OpenCodeAdapter, PiAdapter,
+                HostAdapter, ShellTools)
+    for cls in adapters:
+        assert issubclass(cls, BaseAdapter), f"{cls.__name__} must subclass BaseAdapter"
+
+
+def test_every_adapter_implements_chat_and_get_status():
+    """The two members of the contract."""
+    from swe_review.tools.base import BaseAdapter
+    from swe_review.tools.claude_code_adapter import ClaudeCodeAdapter
+    from swe_review.tools.cursor_adapter import CursorAdapter
+    from swe_review.tools.host_adapter import HostAdapter
+    from swe_review.tools.opencode_adapter import OpenCodeAdapter
+    from swe_review.tools.pi_adapter import PiAdapter
+    from swe_review.tools.shell_tools import ShellTools
+
+    base_chat = BaseAdapter.__dict__["chat"]
+    base_status = BaseAdapter.__dict__["get_status"]
+    for cls in (ClaudeCodeAdapter, CursorAdapter, OpenCodeAdapter, PiAdapter,
+                HostAdapter, ShellTools):
+        assert cls.__dict__.get("chat") is not base_chat, \
+            f"{cls.__name__} must override chat()"
+        assert cls.__dict__.get("get_status") is not base_status, \
+            f"{cls.__name__} must override get_status()"
+
+
+def test_every_adapter_implements_diagnose():
+    """`diagnose` is optional in the ABC but now uniform across shipped adapters."""
+    from swe_review.tools.claude_code_adapter import ClaudeCodeAdapter
+    from swe_review.tools.cursor_adapter import CursorAdapter
+    from swe_review.tools.host_adapter import HostAdapter
+    from swe_review.tools.opencode_adapter import OpenCodeAdapter
+    from swe_review.tools.pi_adapter import PiAdapter
+    from swe_review.tools.shell_tools import ShellTools
+
+    for cls in (ClaudeCodeAdapter, CursorAdapter, OpenCodeAdapter, PiAdapter,
+                HostAdapter, ShellTools):
+        assert callable(getattr(cls, "diagnose", None)), \
+            f"{cls.__name__} must provide diagnose()"
+
+
+def test_base_adapter_stays_instantiable():
+    """Skill falls back to `BaseAdapter()`; an ABC here would break that path."""
+    from swe_review.tools.base import BaseAdapter
+
+    adapter = BaseAdapter()
+    assert adapter.name == "base"
+    assert adapter.get_status()["configured"] is False
+
+
+def test_pty_runner_debug_switch_is_off_by_default(capsys):
+    """Swallowed OSErrors stay quiet unless SWE_REVIEW_PTY_DEBUG is set.
+
+    These failures are non-fatal by design (teardown paths legitimately fail), so
+    normal runs must not get noisier — but they were previously impossible to
+    attribute when the child's output came back truncated.
+    """
+    from swe_review.tools import _pty_runner
+
+    assert _pty_runner._PTY_DEBUG is False
+    _pty_runner._note_ignored(OSError("boom"), "unit test")
+    assert capsys.readouterr().err == ""

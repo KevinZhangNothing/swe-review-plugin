@@ -5,12 +5,13 @@ shell_tools - 兜底的 shell 工具集
 主要意义是跑通 pipeline + 离线测试。
 """
 
+from .base import BaseAdapter
 import json
 import re
 from typing import Dict, Any, Optional, Tuple
 
 
-class ShellTools:
+class ShellTools(BaseAdapter):
     name = "shell"
 
     async def chat(
@@ -49,4 +50,17 @@ class ShellTools:
             "backend": "shell-placeholder",
             "hint": "Offline stub: returns a fixed request_changes payload without "
                     "calling any LLM. Use it for pipeline smoke tests only.",
+        }
+
+    def diagnose(self) -> Dict[str, Any]:
+        """Present for contract uniformity; the stub has nothing to diagnose.
+
+        The other adapters probe a CLI binary here. `ShellTools` shells out to
+        nothing, so it reports that fact instead of pretending to check.
+        """
+        return {
+            "name": self.name,
+            "is_placeholder": True,
+            "checks": [],
+            "note": "shell adapter calls no external process — nothing to diagnose",
         }

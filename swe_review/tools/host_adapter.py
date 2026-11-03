@@ -47,6 +47,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .base import BaseAdapter
+
 #: Default rendezvous dir when neither --host-dir nor HostAdapter(work_dir=) is given.
 DEFAULT_HOST_DIR = ".swe-host"
 
@@ -165,7 +167,7 @@ class HostRequest:
         return out
 
 
-class HostAdapter:
+class HostAdapter(BaseAdapter):
     """Answers come from the agent that is currently running — not from a
     spawned ``claude``/``pi``/``opencode``/``agent`` subprocess."""
 

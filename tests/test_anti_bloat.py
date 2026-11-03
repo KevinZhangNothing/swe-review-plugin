@@ -22,6 +22,7 @@ from swe_review.subagents.analyzer_agent import (
 )
 from swe_review.subagents.generator_agent import GeneratorSubAgent
 from swe_review.subagents.reviser_agent import ReviserSubAgent
+from swe_review.subagents.diff_sharding import plan_shards
 from swe_review.subagents.reviewer_agent import (
     ReviewerSubAgent,
     _normalize_complexity_delta,
@@ -832,3 +833,240 @@ def test_prompt_covers_field_growth_and_duplicated_lists():
     assert "field_list_duplication" in sp
     # The self-check must ask the question that would have caught it.
     assert "新增字段是否需要在另一处清单同步修改" in sp
+
+
+# ---------------------------------------------------------------------------
+# Protocol signals must not be swallowed by shard error-isolation
+# ---------------------------------------------------------------------------
+# Found by a whole-package self-loop: with `--tool host` and a diff large enough
+# to shard, EVERY shard raised HostTurnRequired (a prompt was on disk, nobody had
+# answered it), the shards' `gather(return_exceptions=True)` folded that control
+# signal into "failed shard", and the caller got:
+#
+#     decision = request_changes
+#     parse_error = sharded_review_all_shards_failed: shard 1: HostTurnRequired…
+#
+# i.e. the user saw a code verdict when the truth was "answer 6 prompts". The
+# exact failure loop_agent documents having fixed for best_of_n/revise waves —
+# `_raise_protocol_signals` — was never applied to the sharded REVIEW path.
+
+def _host_pending_adapter(pending: int):
+    from pathlib import Path
+
+    from swe_review.tools.host_adapter import HostTurnRequired
+
+    class PendingAdapter:
+        name = "host"
+
+        async def chat(self, system, user, max_tokens=4096, temperature=0.1):
+            raise HostTurnRequired("cafebabe" * 2, Path("/tmp/x.json"),
+                                   pending_count=pending)
+
+    return PendingAdapter()
+
+
+def _multi_shard_diff(files: int = 6, lines: int = 300) -> str:
+    diff = ""
+    for i in range(files):
+        diff += (f"diff --git a/f{i}.py b/f{i}.py\n"
+                 f"@@ -1,1 +1,2 @@\n x\n" + f"+y{i} = 1\n" * lines)
+    return diff
+
+
+def test_sharded_review_propagates_host_turn_required():
+    """An unanswered host prompt must reach the caller, not become a verdict."""
+    from swe_review.tools.host_adapter import HostTurnRequired
+
+    diff = _multi_shard_diff()
+    assert len(plan_shards(diff, 1000)) > 1, "test needs a genuinely sharded diff"
+
+    sub = ReviewerSubAgent(tool_adapter=_host_pending_adapter(6),
+                           prompt_style="engineering",
+                           shard_budget_chars=1000, shard_concurrency=2)
+    try:
+        asyncio.run(sub.execute({"issue": "x", "pr_title": "t", "pr_diff": diff}))
+    except HostTurnRequired as exc:
+        assert exc.pending_count == 6
+    else:
+        raise AssertionError(
+            "HostTurnRequired was swallowed; the caller cannot tell an "
+            "unanswered prompt from a real review verdict")
+
+
+def test_shard_real_failure_still_isolated():
+    """Ordinary shard errors must keep being isolated, not re-raised."""
+    class FlakyAdapter:
+        name = "flaky"
+        calls = 0
+
+        async def chat(self, system, user, max_tokens=4096, temperature=0.1):
+            FlakyAdapter.calls += 1
+            if FlakyAdapter.calls == 1:
+                raise RuntimeError("transient gateway blip")
+            return ('{"decision":"approve","confidence":0.9,"summary":{},'
+                    '"findings":[],"scores":{},"hard_gate":'
+                    '{"triggered":false,"reason":""}}'), {}
+
+    diff = _multi_shard_diff(files=3, lines=300)
+    sub = ReviewerSubAgent(tool_adapter=FlakyAdapter(), prompt_style="engineering",
+                           shard_budget_chars=1000, shard_concurrency=1,
+                           max_regen_attempts=1)
+    report = asyncio.run(sub.execute(
+        {"issue": "x", "pr_title": "t", "pr_diff": diff}))
+    # The review survives: at least one shard contributed.
+    assert report is not None
+
+
+# ---------------------------------------------------------------------------
+# One rule for "this batch never really ran"
+# ---------------------------------------------------------------------------
+# The rule lived in two places and the two disagreed: loop_agent re-raised
+# HostTurnRequired but swallowed FileNotFoundError, while reviewer_agent's retry
+# wrapper re-raised both. A missing CLI binary could therefore read as "every
+# candidate failed review". `subagents/_protocol.py` is now the single source.
+
+def test_protocol_signal_covers_unanswered_host_and_missing_cli():
+    from swe_review.subagents._protocol import is_protocol_signal
+    from swe_review.tools.host_adapter import HostTurnRequired
+
+    assert is_protocol_signal(HostTurnRequired("k" * 16, __import__("pathlib").Path("/x")))
+    assert is_protocol_signal(FileNotFoundError("no such binary: claude"))
+    # Ordinary adapter failures stay isolated per candidate.
+    assert not is_protocol_signal(RuntimeError("gateway 502"))
+    assert not is_protocol_signal(ValueError("bad payload"))
+
+
+def test_raise_protocol_signals_raises_first_signal():
+    from swe_review.subagents._protocol import raise_protocol_signals
+
+    ok = ["fine", 1]
+    raise_protocol_signals(ok)  # no signal -> no raise
+    try:
+        raise_protocol_signals(["fine", FileNotFoundError("claude missing")])
+    except FileNotFoundError as exc:
+        assert "claude" in str(exc)
+    else:
+        raise AssertionError("FileNotFoundError must escape error isolation")
+
+
+def test_loop_and_reviewer_share_the_same_protocol_predicate():
+    """Guards against the duplication reappearing in one layer only."""
+    from swe_review.subagents import _protocol, loop_agent, reviewer_agent
+
+    assert loop_agent._is_protocol_signal is _protocol.is_protocol_signal
+    assert loop_agent._raise_protocol_signals is _protocol.raise_protocol_signals
+    assert reviewer_agent.raise_protocol_signals is _protocol.raise_protocol_signals
+
+
+def test_deterministic_aggregation_is_machine_readable():
+    """A verdict no model produced must say so in a field, not only in prose.
+
+    `_worst_case_report` runs when shard synthesis is unavailable: the decision
+    and scores are aggregated in code. Previously that was stated only inside
+    `summary['sharded_review']`, so a consumer comparing two reports could not
+    tell a scoreless deterministic aggregation from a model review that simply
+    omitted scores — "reviewed" vs "not reviewed".
+    """
+    from swe_review.subagents.reviewer_agent import ReviewerSubAgent, ReviewReport
+
+    sub = ReviewerSubAgent(tool_adapter=None, prompt_style="engineering")
+    shard_reports = [
+        ReviewReport(decision="request_changes", confidence=0.6,
+                     scores={"simplicity": {"score": 5, "max": 10, "reason": "x"}},
+                     prompt_style="engineering"),
+        ReviewReport(decision="approve", confidence=0.9, prompt_style="engineering"),
+    ]
+    worst = sub._worst_case_report(shard_reports)
+    assert worst.aggregation_mode == "deterministic"
+    assert worst.to_dict()["aggregation_mode"] == "deterministic"
+    # Strictest decision wins, worst score per dimension — unchanged behaviour.
+    assert worst.decision == "request_changes"
+    assert worst.scores["simplicity"]["score"] == 5
+
+
+def test_default_aggregation_mode_is_single_call():
+    from swe_review.subagents.reviewer_agent import ReviewReport
+
+    assert ReviewReport(decision="approve", confidence=0.9).aggregation_mode == "single_call"
+
+
+def test_confidence_capped_when_exploration_degraded():
+    """An unadjusted 0.95 built on a truncated caller graph reads as grounded.
+
+    The model reports how sure it is about the CODE; it cannot know the explorer
+    hit MAX_RELATED_FILES or never ran. That knowledge lives in the harness, so
+    the cap is applied after the answer and surfaced in `summary`.
+    """
+    from swe_review.subagents.reviewer_agent import (
+        ReviewerSubAgent, ReviewReport, _cap_confidence_for_evidence,
+    )
+
+    r = ReviewReport(decision="approve", confidence=0.95, summary={"a": "b"})
+    r.exploration_truncated = True
+    _cap_confidence_for_evidence(r)
+    assert r.confidence == 0.75
+    assert "confidence_capped" in r.summary
+    # The original value stays legible in the note.
+    assert "0.95" in r.summary["confidence_capped"]
+
+
+def test_confidence_capped_harder_when_explorer_never_ran():
+    from swe_review.subagents.reviewer_agent import (
+        ReviewReport, _cap_confidence_for_evidence,
+    )
+
+    r = ReviewReport(decision="approve", confidence=0.9)
+    r.exploration_degraded = "explore_timeout"
+    _cap_confidence_for_evidence(r)
+    assert r.confidence == 0.55
+    assert "degraded" in r.summary["confidence_capped"]
+
+
+def test_confidence_never_raised_by_the_cap():
+    from swe_review.subagents.reviewer_agent import (
+        ReviewReport, _cap_confidence_for_evidence,
+    )
+
+    r = ReviewReport(decision="request_changes", confidence=0.3)
+    r.exploration_truncated = True
+    _cap_confidence_for_evidence(r)
+    assert r.confidence == 0.3          # already below the ceiling
+
+
+def test_confidence_untouched_with_full_evidence():
+    from swe_review.subagents.reviewer_agent import (
+        ReviewReport, _cap_confidence_for_evidence,
+    )
+
+    r = ReviewReport(decision="approve", confidence=0.95)
+    _cap_confidence_for_evidence(r)
+    assert r.confidence == 0.95
+    assert "confidence_capped" not in r.summary
+
+
+def test_prompt_score_schema_matches_scoring_constants():
+    """The prompt and the parser must never disagree about a dimension.
+
+    Regression (the only P2 from a whole-package self-review): the eight
+    dimensions were written twice — as `SCORE_DIMENSIONS`, and as hand-written
+    literals inside the output contract. Changing a max in one place made the
+    prompt ask for 0-20 while the parser enforced 15, with no assertion between
+    them. The contract block is now generated from the constant.
+    """
+    import re
+
+    from swe_review.subagents import engineering_prompt
+    from swe_review.subagents.reviewer_agent import SCORE_DIMENSIONS
+
+    sp = engineering_prompt.system_prompt(["Python"])
+    declared = {name: int(mx) for name, _score, mx in
+                re.findall(r'"(\w+)":\{"score": 0-(\d+), "max": (\d+)', sp)}
+    assert declared == SCORE_DIMENSIONS
+    assert sum(declared.values()) == 100
+
+
+def test_score_dimensions_have_a_single_definition():
+    """One dict object, reachable from both modules."""
+    from swe_review.subagents import engineering_prompt, reviewer_agent
+
+    assert reviewer_agent.SCORE_DIMENSIONS is engineering_prompt.SCORE_DIMENSIONS

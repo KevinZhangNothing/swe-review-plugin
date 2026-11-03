@@ -21,6 +21,7 @@ import shlex
 import shutil
 from typing import Dict, Any, Optional, Tuple
 
+from .base import BaseAdapter
 from ._pty_runner import (
     load_claude_env, run_in_pty, strip_ansi, strip_fences, extract_tokens_from_text,
 )
@@ -37,7 +38,7 @@ def _find_cli() -> str:
     )
 
 
-class ClaudeCodeAdapter:
+class ClaudeCodeAdapter(BaseAdapter):
     name = "claude_code"
 
     def __init__(

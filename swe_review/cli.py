@@ -275,6 +275,22 @@ def _build_check_config(args) -> dict:
     return {k: v for k, v in cfg.items() if v is not None}
 
 
+def _add_change_identity_args(p, *, with_body: bool = False) -> None:
+    """The issue/diff/repo triple shared by `review`, `revise` and `loop`.
+
+    Registered in one place so the help text and defaults cannot drift between
+    subcommands — `--pr-diff`'s "path or '-' for stdin" wording and
+    `--repo-path`'s default had been copied three and four times respectively.
+    `with_body` adds `--pr-body`, which only `review` accepts today.
+    """
+    p.add_argument("--issue", required=True)
+    p.add_argument("--pr-title", default="")
+    if with_body:
+        p.add_argument("--pr-body", default="")
+    p.add_argument("--pr-diff", required=True, help="path or '-' for stdin")
+    p.add_argument("--repo-path", default=".")
+
+
 def _add_sandbox_args(p) -> None:
     """Sandbox toggle, shared by `verify` and `loop`.
 
@@ -403,11 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ins.add_argument("--pi-skills-dir", default="~/.pi/agent/skills", help="destination root")
 
     p_rev = sub.add_parser("review", help="review a candidate PR")
-    p_rev.add_argument("--issue", required=True)
-    p_rev.add_argument("--pr-title", default="")
-    p_rev.add_argument("--pr-body", default="")
-    p_rev.add_argument("--pr-diff", required=True, help="path or '-' for stdin")
-    p_rev.add_argument("--repo-path", default=".")
+    _add_change_identity_args(p_rev, with_body=True)
     _add_tool_arg(p_rev)
     _add_host_args(p_rev)
     _add_timeout_arg(p_rev)
@@ -425,12 +437,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rev.set_defaults(handler=_cmd_review)
 
     p_rvs = sub.add_parser("revise", help="revise a candidate PR by review feedback")
-    p_rvs.add_argument("--issue", required=True)
-    p_rvs.add_argument("--pr-title", default="")
-    p_rvs.add_argument("--pr-diff", required=True, help="path or '-' for stdin")
+    _add_change_identity_args(p_rvs)
     p_rvs.add_argument("--review-report", required=True,
                        help="JSON file with {decision, defects[]} or path")
-    p_rvs.add_argument("--repo-path", default=".")
     _add_tool_arg(p_rvs)
     _add_host_args(p_rvs)
     _add_timeout_arg(p_rvs)

@@ -34,6 +34,21 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
+#: Set `SWE_REVIEW_PTY_DEBUG=1` to have silently-ignored OSErrors printed to
+#: stderr. They stay non-fatal — the PTY teardown paths (kill/close/drain after
+#: the child already exited) legitimately fail and must not abort a run — but a
+#: read/select failure that silently truncates the child's output was previously
+#: impossible to attribute. Opt-in keeps normal runs quiet.
+_PTY_DEBUG = bool(os.environ.get("SWE_REVIEW_PTY_DEBUG"))
+
+
+def _note_ignored(exc: OSError, where: str) -> None:
+    """Record a swallowed OSError. No-op unless SWE_REVIEW_PTY_DEBUG is set."""
+    if _PTY_DEBUG:
+        print(f"[pty_runner] ignoring {type(exc).__name__} at {where}: {exc}",
+              file=sys.stderr)
+
+
 # Settings files scanned for ANTHROPIC_* env vars (auth proxy + base URL).
 _CLAUDE_SETTINGS_PATHS = [
     Path("~/.claude/settings.local.json").expanduser(),
@@ -99,7 +114,11 @@ def run_in_pty(
             for k, v in (extra_env or {}).items():
                 os.environ[k] = v
             os.execvpe(argv[0], argv, env)
-        except OSError:
+        except OSError as exc:
+            # In the forked child: we cannot raise, and the parent learns about
+            # the failure via exit code 127. Report the cause on stderr so the
+            # debug switch explains a bare 127.
+            _note_ignored(exc, "execvpe in forked child")
             os._exit(127)
 
     chunks: List[bytes] = []
@@ -118,12 +137,15 @@ def run_in_pty(
 
             try:
                 rlist, _, _ = select.select([master_fd], [], [], min(1.0, remaining))
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                if isinstance(exc, OSError):
+                    _note_ignored(exc, "select on master_fd")
                 break
             if master_fd in rlist:
                 try:
                     data = os.read(master_fd, 4096)
-                except OSError:
+                except OSError as exc:
+                    _note_ignored(exc, "read from master_fd")
                     break
                 if not data:
                     # PTY closed (child exited)
@@ -141,8 +163,11 @@ def run_in_pty(
                             if not data:
                                 break
                             chunks.append(data)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        # The child exited with unread output still buffered; what
+                        # we already read is kept, but the tail is lost. Silent
+                        # unless SWE_REVIEW_PTY_DEBUG is on.
+                        _note_ignored(exc, "drain remaining output")
                     break
             except ChildProcessError:
                 break
