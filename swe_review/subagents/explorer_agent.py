@@ -8,13 +8,14 @@ Explorer SubAgent - 仓库探索 SubAgent
 4) 追踪 caller-callee 关系
 
 输出 ExplorationResult：
-  - files_modified, related_files, test_files
+  - files_modified, related_files, test_files, test_coverage_map
   - file_contents (修改文件 + 相关文件，含 caller_chain 摘要)
   - call_chain
   - keywords, root_hint  (供 reviewer 推断 root cause)
   - steps  (实际执行的步骤数，便于观测)
 """
 
+import ast
 import os
 import re
 import subprocess
@@ -31,6 +32,7 @@ class ExplorationResult:
     files_modified: List[str] = field(default_factory=list)
     related_files: List[str] = field(default_factory=list)
     test_files: List[str] = field(default_factory=list)
+    test_coverage_map: Dict[str, List[str]] = field(default_factory=dict)
     file_contents: Dict[str, str] = field(default_factory=dict)
     call_chain: List[Dict[str, str]] = field(default_factory=list)
     keywords: List[str] = field(default_factory=list)
@@ -126,6 +128,7 @@ class ExplorerSubAgent:
 
         # 4) 找测试文件
         result.test_files = self._find_test_files(result.files_modified)
+        result.test_coverage_map = self._map_test_coverage(result.files_modified)
         result.steps += 1
 
         # 5) 读关键文件内容（含截断）
@@ -242,6 +245,98 @@ class ExplorerSubAgent:
                         if rel not in tests:
                             tests.append(rel)
         return tests
+
+    # ------------------------------------------------------------------
+    # changed file -> test mapping (imports + naming convention)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _module_dotted(rel: str) -> str:
+        parts = list(Path(rel).with_suffix("").parts)
+        if parts and parts[-1] == "__init__":
+            parts = parts[:-1]
+        return ".".join(parts)
+
+    @staticmethod
+    def _imported_modules(text: str) -> set:
+        """Dotted module paths a Python test file imports.
+
+        AST-based on purpose. A line/regex scanner mis-reads a trailing
+        comment ("import pkg.foo  # noqa" became the module string
+        "pkg.foo  # noqa: F401"), treats docstring prose that looks like an
+        import as a real import, and misses a parenthesised from-import that
+        wraps across lines. All three were reproduced during review of this
+        feature; parsing the syntax removes the whole class.
+        """
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            return set()
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    # Relative import: it has no repo-relative module path, so
+                    # it cannot be matched against a changed file safely.
+                    continue
+                module = node.module or ""
+                if module:
+                    imported.add(module)
+                for alias in node.names:
+                    imported.add(f"{module}.{alias.name}" if module else alias.name)
+        return imported
+
+    def _test_coverage_candidates(self, source_files: List[str]) -> List[str]:
+        """Every .py test file worth indexing: test roots + co-located tests.
+
+        De-duplicated so the caller reads each file exactly once.
+        """
+        candidates: List[str] = []
+        for root_name in TEST_ROOT_NAMES:
+            root = self.repo_path / root_name
+            if root.is_dir():
+                candidates.extend(str(p.relative_to(self.repo_path))
+                                  for p in sorted(root.rglob("*.py")))
+        for src in source_files:
+            parent = self.repo_path / Path(src).parent
+            if parent.is_dir():
+                candidates.extend(str(p.relative_to(self.repo_path))
+                                  for p in sorted(parent.glob("test_*.py")))
+        return list(dict.fromkeys(candidates))
+
+    def _map_test_coverage(self, source_files: List[str]) -> Dict[str, List[str]]:
+        # Non-Python changes contribute an empty entry only (issue contract);
+        # return before touching the test tree when there is nothing to index.
+        if not any(str(src).endswith(".py") for src in source_files):
+            return {src: [] for src in source_files}
+
+        # One pass over the test tree. The per-source scan this replaced
+        # re-read and re-parsed every test file once per changed file
+        # (measured: 575 reads / 7.03 MB for a 25-file diff, where 23 distinct
+        # test files suffice), and it ran even when no source was modified.
+        imported: Dict[str, set] = {}
+        for rel in self._test_coverage_candidates(source_files):
+            path = self.repo_path / rel
+            try:
+                if not path.is_file() or path.stat().st_size > 1_000_000:
+                    continue
+                imported[rel] = self._imported_modules(
+                    path.read_text(errors="replace"))
+            except OSError:
+                continue
+
+        mapping: Dict[str, List[str]] = {}
+        for src in source_files:
+            found = set()
+            if str(src).endswith(".py"):
+                found.update(self._find_test_files([src]))
+                dotted = self._module_dotted(src)
+                for rel, modules in imported.items():
+                    if dotted in modules:
+                        found.add(rel)
+            mapping[src] = sorted(found)
+        return mapping
 
     def _read_key_files(self, files: List[str]) -> Tuple[Dict[str, str], bool]:
         contents: Dict[str, str] = {}
