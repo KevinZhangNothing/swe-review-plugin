@@ -147,6 +147,49 @@ and must name the concrete replacement), and language-specific checks
 (JS/TS, Python, Go, Rust, SQL — auto-trimmed to the languages present in the diff to
 control fixed prompt token cost).
 
+### Anti-bloat / patch-stacking check
+
+The review explicitly targets **additive problem solving** — resolving a local symptom by
+ADDING a bool, a flag, a guard, a compatibility branch or a wrapper layer instead of
+adjusting the logic that is already there. `Patch Analysis` carries a `bloat_signals`
+array computed statically (no LLM) by `detect_bloat_signals`:
+
+| signal | fires when |
+|---|---|
+| `additive_only_change` | an **existing** file gained ≥8 real lines and lost none |
+| `flag_accumulation` | ≥2 new boolean-ish state variables |
+| `guard_stacking` | ≥3 added conditionals with **no** conditional removed |
+| `compat_layer` | ≥2 added fallback/legacy/workaround markers |
+| `wrapper_growth` | a ≤40-line additive change to an existing file adds a new top-level def/class |
+
+Thresholds sit deliberately above one: a single necessary variable or guard is ordinary
+engineering and is never reported. Signals are **evidence, not verdicts** — a signal the
+model judges inapplicable must be dismissed with a reason, not silently ignored.
+
+Prose is never read as code. Comments, docstrings/block literals (including a docstring
+opened by an unchanged context line), prompt string literals, symbol definitions that
+merely name a concept, and non-code files (`*.md`, `*.toml`, `*.yaml`, …) are all
+excluded from signal matching. Each of those exclusions fixes a real false positive found
+by running the detector against its own source; `additive_only_change` still counts every
+real added line, prose included, because growth is growth.
+
+The prompt also ranks revision strategies (modify existing logic > reuse existing
+symbols > simplify structure > add one variable > add several states > add a parallel
+mechanism) and requires a mandatory quantitative self-report in the output:
+
+```json
+"complexity_delta": {
+  "new_state_vars": 2, "new_functions": 0,
+  "derivable_state": "has_fallback",
+  "removable_old_code": "legacy_charge branch",
+  "net_complexity": "reduced | neutral | increased"
+}
+```
+
+`net_complexity: increased` without a corresponding finding or action is an unsupported
+scoring claim. `constraint_category` is propagated into the derived `defects[]` so the
+reviser can tell "delete the redundant flag" from "add the missing branch".
+
 ## Output JSON schema — concise / detailed (legacy)
 
 ```json

@@ -5,13 +5,14 @@ Analyzer SubAgent - 静态分析
 - diff hunk 复杂度（行数 / 嵌套 / 函数嵌套）
 - 怀疑的回归点（修改的 public API）
 - 调用影响范围粗算
+- 反臃肿信号（flag 堆积 / 分支叠加 / 只加不删 / 小改动加包装层）
 
 不读 LLM，纯规则。
 """
 
 import re
 from collections import Counter
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 
 
@@ -28,6 +29,10 @@ class AnalyzerResult:
     # multiple hunks/files — evidence for "extract a common function instead
     # of duplicating". Fed to the reviewer inside Patch Analysis.
     repeated_added_blocks: List[Dict[str, Any]] = field(default_factory=list)
+    # Anti-bloat signals (flag accumulation, guard stacking, additive-only
+    # change, compat layer, wrapper growth) — static evidence for "this change
+    # stacks new state/branches instead of simplifying the existing logic".
+    bloat_signals: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -52,6 +57,21 @@ _TEST_PATH_RE = re.compile(
     r"|(^|/)[^/]*_test\.[A-Za-z0-9]+$"
     r"|\.(test|spec)\.[A-Za-z0-9]+$"
 )
+
+
+#: Directories whose contents are produced by a build/sync step and committed as
+#: byte-identical copies. A line repeating between a source and its mirror is not
+#: copy-pasted logic. Kept separate from `_NON_CODE_PATH_RE` because these hold
+#: real code too — only the copy-paste signal is meaningless for them.
+_GENERATED_PATH_RE = re.compile(
+    r"(^|/)(?:\.claude_skills|build|dist|node_modules|\.venv|__pycache__)/"
+    r"|\.min\.(?:js|css)$"
+)
+
+
+def _is_generated_path(path: str) -> bool:
+    """True when a path is machine-produced output or a mirror of one."""
+    return bool(path) and bool(_GENERATED_PATH_RE.search(path))
 
 
 def detect_repeated_added_blocks(
@@ -88,6 +108,12 @@ def detect_repeated_added_blocks(
             continue
         if line.startswith("+++") or not line.startswith("+"):
             continue
+        # Generated mirrors are byte-identical copies by design, so every line in
+        # them repeats — that is the mirror doing its job, not copy-pasted logic.
+        # Seen in this project's own self-review: 10/10 repeated blocks were
+        # `.claude/skills/…/SKILL.md` vs its `swe_review/.claude_skills/` mirror.
+        if _is_generated_path(current_file):
+            continue
         text = line[1:].strip()
         if len(text) < min_line_len or _REDUNDANCY_SKIP_RE.match(text):
             continue
@@ -111,6 +137,358 @@ def detect_repeated_added_blocks(
         })
         if len(out) >= cap:
             break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Anti-bloat signals — static evidence for ADDITIVE problem solving
+# ---------------------------------------------------------------------------
+# The failure mode these target is "patch stacking": a change that resolves a
+# local symptom by ADDING a bool, a flag, a guard, a compatibility branch, or a
+# wrapper layer, instead of adjusting the logic that is already there. The cost
+# is invisible per change and compounds across changes.
+#
+# None of these signals is a verdict. Each one is countable evidence handed to
+# the reviewer, and the thresholds sit deliberately ABOVE one: adding one
+# necessary variable or one guard is normal engineering, so reporting it would
+# be exactly the low-value noise the review prompt forbids.
+
+#: A declared boolean-ish state variable (`self.done = False`, `let ok = true`,
+#: `is_open: bool = True`). The NAME must also look like a flag — `x = 0` or a
+#: literal assignment to `result` is not a state flag.
+_FLAG_DECL_RE = re.compile(
+    r"^[ \t]*(?:self\.|this\.|cls\.)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*"
+    r"(?::[ \t]*(?:bool|boolean))?[ \t]*=[ \t]*"
+    r"(?:True|False|true|false|None|null)[ \t]*$"
+)
+_FLAG_NAME_RE = re.compile(
+    r"(?:^|_)(?:is|has|should|can|could|allow|enable|enabled|disable|skip|use)_"
+    r"|(?:^|_)(?:flag|flags|enabled|disabled|mode)$",
+    re.IGNORECASE,
+)
+
+#: An added conditional / guard. `\}\s*` tolerates brace-style closers.
+_CONDITION_RE = re.compile(
+    r"^[ \t]*(?:\}[ \t]*)?(?:if|elif|else\s+if|else|switch|case|when|unless|guard)\b"
+)
+
+#: Markers of a compatibility / safety-net layer added on top of old logic.
+#: Underscore counts as a separator (NOT a word character): the most common real
+#: spelling is a compound name (`legacy_mode`, `compat_shim`, `fallback_path`),
+#: which `\b`-based matching silently missed.
+#: The capture group is what makes `compat_layer` mean "several DIFFERENT
+#: compatibility mechanisms coexist". Counting raw line hits instead made the
+#: detector report itself: `_COMPAT_RE.search`, `compat.append`, `len(compat)` are
+#: five occurrences of ONE concept, not a layer stack.
+_COMPAT_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])(fallback|legacy|compat|compatible|backward"
+    r"|deprecated|workaround|graceful|defensive)(?:[^A-Za-z0-9]|$)",
+    re.IGNORECASE,
+)
+
+#: A line that DEFINES a symbol rather than uses it (`_COMPAT_RE = re.compile(...)`).
+#: Such a line merely names the concept; counting it made this detector report
+#: `compat_layer` against its own definition during self-review.
+_SYMBOL_DEF_RE = re.compile(r"^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*(?::[^=]+)?=(?!=)")
+
+def _indent_of(text: str) -> int:
+    """Leading-whitespace width, used to tell "inside the new def" from "outside"."""
+    return len(text) - len(text.lstrip())
+
+#: A line that is entirely a comment in any of the supported syntaxes.
+_COMMENT_ONLY_RE = re.compile(r"^[ \t]*(?:#|//|/\*|\*|<!--)")
+
+#: A line that is entirely a string/block-literal line (a prompt, a message).
+_LITERAL_LINE_RE = re.compile(r"""^[ \t]*(?:[rbuf]{0,2})(?:["']|\"\"\"|''')""")
+
+#: `@@ -0,0 +1,N @@` — the hunk that creates a brand-new file. Additions in a
+#: new file carry no deletions by definition, so they must never be read as
+#: "additive-only change".
+_NEW_FILE_HUNK_RE = re.compile(r"^@@ -0,0 ")
+_TOP_LEVEL_DEF_RE = re.compile(r"^(?:async[ \t]+)?(?:def|class)[ \t]+([A-Za-z_][A-Za-z0-9_]*)")
+
+_TRIPLE_QUOTES = ('"""', "'''")
+
+
+def _scan_literal(text: str, inside: bool) -> Tuple[bool, bool]:
+    """Advance block-literal state by one line.
+
+    Returns ``(is_prose, new_state)``. The first element answers "is this line
+    itself prose?" — either it is already inside a block, or it opens one here
+    (the opener line carries prose too). The second is the state the next line
+    starts in.
+
+    Odd triple-quote count crosses a boundary (opens or closes a block), so the
+    state flips; even count leaves it unchanged. Tracking this on CONTEXT lines
+    as well as added ones is load-bearing: a docstring is usually opened by an
+    unchanged line, and advancing only on `+` lines desynchronised the state so
+    later prose got matched as code.
+    """
+    trips = sum(text.count(q) for q in _TRIPLE_QUOTES)
+    if trips % 2:
+        return True, not inside
+    return inside, inside
+
+
+def _is_prose_line(text: str) -> bool:
+    """True when a line is documentation/prompt text rather than code.
+
+    Kept as one predicate instead of inline conditions at each call site: the
+    signal loop needs a single, testable answer to "does this line execute?".
+    """
+    return bool(_COMMENT_ONLY_RE.match(text) or _LITERAL_LINE_RE.match(text))
+
+#: Added/removed lines that are pure structure — counting them as evidence of
+#: "new logic" overstates every signal. Each branch MUST require at least one
+#: significant character: an earlier form allowed the closer set to match the
+#: empty string, which classified every added line as structural and silently
+#: disabled `additive_only_change`. Comments are NOT handled here — they are
+#: prose, and `_is_prose_line` owns that judgement in one place.
+_STRUCTURAL_ONLY_RE = re.compile(
+    r"^[ \t]*(?:"
+    r"[}\]\)]+[;,]?[ \t]*(?:(?:#|//).*)?$"
+    r"|(?:pass|continue|break|else|try|finally)\b[ \t]*:?[ \t]*$"
+    r")"
+)
+
+
+def _effective_added(text: str) -> bool:
+    """True when an added line carries real logic (not a closer/comment)."""
+    stripped = text.strip()
+    if not stripped or _STRUCTURAL_ONLY_RE.match(text):
+        return False
+    return len(stripped) >= 4
+
+
+#: Files whose diff content is prose/config, not executable logic. Bloat signals
+#: judge whether CODE grew by stacking state and branches; a README section or a
+#: SKILL.md rule that happens to contain the word "fallback" is not evidence of
+#: anything. Observed directly: documenting these very signals inside
+#: engineering_prompt.py made the detector report `compat_layer` against the
+#: prompt text itself.
+_NON_CODE_PATH_RE = re.compile(
+    r"\.(?:md|markdown|rst|txt|adoc)$"
+    r"|(?:^|/)(?:README|CHANGELOG|LICENSE|NOTICE)(?:\.[A-Za-z0-9]+)?$"
+    r"|\.(?:json|ya?ml|toml|ini|cfg|lock)$",
+    re.IGNORECASE,
+)
+
+
+def _is_code_path(path: str) -> bool:
+    """True when a path holds executable product logic worth bloat-judging.
+
+    Excludes prose/config (see `_NON_CODE_PATH_RE`) and tests (reuses
+    `_TEST_PATH_RE`): a test named `test_compat_layer_detected` asserts ABOUT a
+    concept rather than being an instance of it, and test files are legitimately
+    additive and branch-heavy.
+    """
+    if not path:
+        return False
+    return not (_NON_CODE_PATH_RE.search(path) or _TEST_PATH_RE.search(path))
+
+
+def detect_bloat_signals(pr_diff: str, cap_per_kind: int = 6) -> List[Dict[str, Any]]:
+    """Return static anti-bloat signals found in a unified diff.
+
+    Each entry is evidence, shaped for the reviewer's Patch Analysis:
+      {"kind", "count", "files", "evidence", "note"}
+
+    Kinds (all thresholds deliberately above one — a single variable or guard is
+    normal engineering and must not be reported):
+
+    - ``additive_only_change`` — an EXISTING file gained >= 8 real lines and lost
+      none. The signature of "solve it by adding, never by adjusting".
+    - ``flag_accumulation``   — >= 2 new boolean-ish state variables. Two flags
+      for one local feature is the "one more bool to control it" spiral.
+    - ``guard_stacking``      — >= 3 added conditionals with no conditional
+      removed. Branches pile up instead of the existing branch being rewritten.
+    - ``compat_layer``        — >= 2 added compatibility/safety-net markers
+      (fallback / legacy / workaround …) layered on old logic.
+    - ``wrapper_growth``      — a small additive change to an EXISTING file that
+      introduces a new top-level def/class. "Simple need → new manager".
+
+    Empty list means no signal — never a statement that the change is clean.
+    """
+    flags: List[Dict[str, str]] = []
+    compat: List[Dict[str, str]] = []
+    wrappers: List[Dict[str, str]] = []
+    guard_added: List[Dict[str, str]] = []
+    #: file -> {"add": int, "del": int, "new_file": bool}
+    per_file: Dict[str, Dict[str, Any]] = {}
+
+    current_file = ""
+    in_new_file = False
+    #: True while inside a multi-line string (docstring / block literal). Text in
+    #: a docstring DESCRIBES behaviour; it is not behaviour, so it must not be
+    #: matched against the anti-bloat patterns.
+    in_docstring = False
+    #: Conditional lines DELETED anywhere in the diff (a rewritten branch means
+    #: the old condition was removed, so stacking did not happen).
+    guard_removed = 0
+    #: Indentation of the body of a function/class this diff CREATES, or None.
+    #: Guards inside a brand-new function are that function's internal logic, not
+    #: branches stacked onto existing code — counting them made "add one
+    #: self-contained helper" report as guard_stacking + wrapper_growth.
+    new_def_indent: Optional[int] = None
+    #: Once inside a created def, a blank line must NOT close it: a top-level
+    #: `def` sits at indent 0, and the blank line right after it would otherwise
+    #: compare equal and reset the scope immediately.
+    in_new_def = False
+
+    for line in (pr_diff or "").split("\n"):
+        if line.startswith("diff --git"):
+            parts = line.split()
+            current_file = (
+                parts[2].removeprefix("a/").removeprefix("b/")
+                if len(parts) >= 3 else ""
+            )
+            in_new_file = False
+            per_file.setdefault(current_file, {"add": 0, "del": 0, "new_file": False})
+            continue
+        if line.startswith("@@"):
+            in_new_file = bool(_NEW_FILE_HUNK_RE.match(line))
+            if current_file and in_new_file:
+                per_file.setdefault(current_file, {"add": 0, "del": 0,
+                                                   "new_file": False})["new_file"] = True
+            continue
+        if line.startswith(("+++", "---", "index ", "new file mode", "\\ ")):
+            continue
+        if not current_file:
+            continue
+        # Prose/config never produces code-bloat evidence (see _NON_CODE_PATH_RE).
+        if not _is_code_path(current_file):
+            continue
+        stats = per_file.setdefault(current_file,
+                                    {"add": 0, "del": 0, "new_file": False})
+
+        # Literal state must advance on CONTEXT lines too, not just added ones — see
+        # _scan_literal. `opens_here` marks the line that opens a block.
+        opens_here, in_docstring = _scan_literal(line[1:], in_docstring)
+
+        if line.startswith("+"):
+            text = line[1:]
+            # Prose is not growth. A change that only appends comments deleted
+            # nothing, but it also ADDED no logic — counting it produced an
+            # `additive_only_change` on every large documentation pass, the
+            # most frequent false positive of this detector.
+            is_prose = opens_here or _is_prose_line(text)
+            if not is_prose and _effective_added(text):
+                stats["add"] += 1
+            body = text.strip()
+
+            # Text that MENTIONS a keyword is not code that USES it: comments,
+            # docstrings and block literals describe behaviour rather than being
+            # behaviour. Skipping them fixes the self-referential false positives
+            # this detector produced against its own source.
+            if is_prose:
+                continue
+
+            # Flag match comes BEFORE the symbol-definition skip: `is_ready =
+            # False` is both a "definition" and a state flag, and skipping it
+            # first silently disabled flag_accumulation for every LOCAL flag —
+            # i.e. exactly the pattern this check exists to catch.
+            m = _FLAG_DECL_RE.match(text)
+            if m and _FLAG_NAME_RE.search(m.group(1)):
+                flags.append({"file": current_file, "line": body[:100]})
+                continue
+
+            if _SYMBOL_DEF_RE.match(text):
+                continue
+
+            # Enter/leave the body of a function or class this diff CREATES. A blank line
+            # never closes the scope (see in_new_def); a non-blank line dedented back
+            # to or past the def does.
+            indent = _indent_of(text)
+            if _TOP_LEVEL_DEF_RE.match(text):
+                new_def_indent, in_new_def = indent, True
+            elif in_new_def and body and indent <= new_def_indent:
+                new_def_indent, in_new_def = None, False
+
+            if _CONDITION_RE.match(text):
+                # A guard inside a brand-new function is that function's own
+                # logic, not a branch stacked onto existing code.
+                guard_added.append({
+                    "file": current_file, "line": body[:100],
+                    "in_new_def": in_new_def,
+                })
+
+            cm = _COMPAT_RE.search(text)
+            if cm:
+                compat.append({"file": current_file, "line": body[:100],
+                               "concept": cm.group(1).lower()})
+
+            dm = _TOP_LEVEL_DEF_RE.match(text)
+            if dm:
+                wrappers.append({"file": current_file, "name": dm.group(1)})
+        elif line.startswith("-"):
+            text = line[1:]
+            if _effective_added(text):
+                stats["del"] += 1
+            if _CONDITION_RE.match(text):
+                guard_removed += 1
+
+    out: List[Dict[str, Any]] = []
+
+    def _add(kind: str, count: int, files: List[str], evidence: List[str],
+             note: str) -> None:
+        out.append({
+            "kind": kind,
+            "count": count,
+            "files": sorted({f for f in files if f})[:5],
+            "evidence": evidence[:cap_per_kind],
+            "note": note,
+        })
+
+    # 1) Existing files that only grow. Two shapes count, and the second was
+    # missing: splitting 30 added lines across 4 files (7 each) is still "add
+    # without adjusting", but no single file reaches the per-file threshold.
+    existing = {p: s for p, s in per_file.items() if not s["new_file"]}
+    growing = [p for p, s in existing.items() if not s["del"] and s["add"] >= 8]
+    if growing:
+        _add("additive_only_change", existing[growing[0]]["add"], [growing[0]],
+             [f"+{existing[growing[0]]['add']} lines, -0 lines in {growing[0]}"],
+             "解决方式只有新增、没有调整既有逻辑；确认这是必要新增还是叠加式修补。")
+    else:
+        total_growth = sum(s["add"] for s in existing.values())
+        total_loss = sum(s["del"] for s in existing.values())
+        if total_growth >= 8 and total_loss == 0:
+            _add("additive_only_change", total_growth, list(existing),
+                 [f"+{total_growth} lines, -0 lines across "
+                  f"{len(existing)} existing file(s)"],
+                 "跨文件合计只有新增、没有调整既有逻辑；确认这是必要新增还是叠加式修补。")
+
+    # 2) Boolean/flag state piling up.
+    if len(flags) >= 2:
+        _add("flag_accumulation", len(flags), [f["file"] for f in flags],
+             [f"{f['file']}: {f['line']}" for f in flags],
+             "本次新增多个布尔状态；确认它们是否都能由已有数据推导，或可合并为一个状态。")
+
+    # 3) Guards piling up without rewriting the existing branch. Guards that live
+    # inside a function this change CREATES are excluded: they are that
+    # function's own logic, not branches layered onto existing code.
+    stacked = [g for g in guard_added if not g["in_new_def"]]
+    if len(stacked) >= 3 and guard_removed == 0:
+        _add("guard_stacking", len(stacked), [g["file"] for g in stacked],
+             [f"{g['file']}: {g['line']}" for g in stacked],
+             "只新增条件分支且未改写既有分支；确认新老逻辑是否应合并统一，而不是层层叠加。")
+
+    # 4) Compatibility / safety-net layer over old logic. Requires >= 2 DIFFERENT
+    # mechanisms: one concept used repeatedly (`compat.append`, `len(compat)`) is
+    # a single mechanism, not a layer stack — that was the self-report noise.
+    compat_concepts = {f["concept"] for f in compat}
+    if len(compat_concepts) >= 2:
+        _add("compat_layer", len(compat), [f["file"] for f in compat],
+             [f"{f['file']}: {f['line']}" for f in compat],
+             "存在兼容/兜底层；确认旧路径是否已无用、能否删除旧逻辑而不是并存两条。")
+
+    # 5) New top-level abstraction inside a small additive change.
+    total_add = sum(s["add"] for s in per_file.values())
+    existing_growth = any(not s["new_file"] for s in per_file.values())
+    if wrappers and existing_growth and total_add <= 40:
+        _add("wrapper_growth", len(wrappers), [w["file"] for w in wrappers],
+             [f"{w['file']}: {w['name']}" for w in wrappers],
+             "小改动引入了新的顶层抽象；确认是否可复用已有实现、或写成内联逻辑。")
+
     return out
 
 
@@ -189,6 +567,7 @@ class AnalyzerSubAgent:
             suspicious_spots=suspicious[:20],
             complexity_score=round(score, 3),
             repeated_added_blocks=detect_repeated_added_blocks(pr_diff),
+            bloat_signals=detect_bloat_signals(pr_diff),
         )
 
     def _split_hunks(self, pr_diff: str) -> List[Dict[str, Any]]:

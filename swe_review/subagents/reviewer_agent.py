@@ -35,7 +35,7 @@ from pathlib import Path
 from datetime import datetime
 
 from . import engineering_prompt
-from .analyzer_agent import detect_repeated_added_blocks
+from .analyzer_agent import detect_bloat_signals, detect_repeated_added_blocks
 from .diff_sharding import (
     DEFAULT_SHARD_BUDGET_CHARS,
     DEFAULT_SHARD_CONCURRENCY,
@@ -137,7 +137,10 @@ class Finding:
 
         Carries why_it_matters / evidence into the description so the reviser
         still receives evidence-rich feedback (the whole point of routing
-        engineering reviews to the detailed revision prompt).
+        engineering reviews to the detailed revision prompt). The constraint
+        category rides along too: without it the reviser cannot tell "delete the
+        redundant flag" from "add the missing branch", which is exactly the
+        distinction that keeps revisions from stacking more code.
         """
         description = self.title
         if self.observation:
@@ -146,6 +149,8 @@ class Finding:
             description += f" [impact: {self.why_it_matters}]"
         if self.evidence:
             description += f" [evidence: {self.evidence}]"
+        if self.constraint_category:
+            description += f" [constraint: {self.constraint_category}]"
         return Defect(
             severity=FINDING_TO_DEFECT_SEVERITY.get(self.severity, "medium"),
             description=description,
@@ -219,6 +224,10 @@ class ReviewReport:
     hard_gate: Dict[str, Any] = field(default_factory=dict)     # engineering style
     whats_good: List[str] = field(default_factory=list)          # engineering style (optional)
     recommended_actions: List[str] = field(default_factory=list)  # engineering style (optional)
+    # Quantitative anti-bloat self-report (new state vars / functions, derivable
+    # state, removable old code, net complexity). Empty when the model omitted
+    # it — absence must stay distinguishable from "reduced".
+    complexity_delta: Dict[str, Any] = field(default_factory=dict)
     parse_error: Optional[str] = None  # set when the model output was not parseable
     truncated_repair: bool = False  # JSON only parsed via truncation repair (tail lost)
     raw_response: str = ""
@@ -290,6 +299,7 @@ class ReviewReport:
             "scores": self.scores,
             "total_score": self.total_score,
             "hard_gate": self.hard_gate,
+            "complexity_delta": self.complexity_delta,
             "whats_good": self.whats_good,
             "recommended_actions": self.recommended_actions,
             "parse_error": self.parse_error,
@@ -1120,6 +1130,10 @@ class ReviewerSubAgent:
             # across hunks/files) — the prompt instructs the model to judge
             # reuse / common-function extraction based on this.
             "repeated_added_blocks": detect_repeated_added_blocks(pr_diff),
+            # Static anti-bloat evidence: this change may be solving the problem
+            # by ADDING state/branches/layers instead of simplifying existing
+            # logic. Empty list means "no signal", never "clean".
+            "bloat_signals": detect_bloat_signals(pr_diff),
         }
 
     def _build_user_prompt_concise(self, issue, pr_title, pr_body, pr_diff, repo_context, analysis):
@@ -1462,6 +1476,43 @@ def pick_enum(value: Any, choices: tuple, default: str) -> str:
     return default
 
 
+NET_COMPLEXITY_CHOICES = ("reduced", "neutral", "increased")
+
+
+def _normalize_complexity_delta(raw: Any) -> Dict[str, Any]:
+    """Normalize the model's quantitative anti-bloat self-report.
+
+    Returns `{}` when the field is absent or unusable, so "the model did not
+    answer" stays distinguishable from "the model answered neutral". Counts are
+    coerced to non-negative ints; a non-numeric or negative count becomes 0
+    rather than propagating a bogus number into reports that downstream
+    consumers compare against.
+    """
+    if not isinstance(raw, dict):
+        return {}
+
+    def _count(key: str) -> int:
+        value = raw.get(key)
+        if isinstance(value, bool):  # bool is an int subclass — reject explicitly
+            return 0
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+        return 0
+
+    def _text(key: str) -> str:
+        value = raw.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    net = _text("net_complexity").lower()
+    return {
+        "new_state_vars": _count("new_state_vars"),
+        "new_functions": _count("new_functions"),
+        "derivable_state": _text("derivable_state"),
+        "removable_old_code": _text("removable_old_code"),
+        "net_complexity": pick_enum(net, NET_COMPLEXITY_CHOICES, ""),
+    }
+
+
 def _coerce_decision(data: Dict[str, Any]) -> tuple[str, float]:
     """Accept BOTH flat and nested decision shapes; emit (flat decision, confidence).
 
@@ -1668,6 +1719,16 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
             f"only {numeric_scores}/{len(SCORE_DIMENSIONS)} dimension scores present")
     if findings and all(not (f.observation or f.evidence) for f in findings):
         sanity_problems.append("all findings lack observation/evidence")
+    # Normalized once: both report shapes below carry it, and computing it at
+    # each construction site duplicated the call verbatim.
+    #
+    # NOTE: the two ReviewReport(...) calls below still repeat ~10 identical
+    # fields, so `detect_repeated_added_blocks` reports this line. That is
+    # accepted, not overlooked: collapsing them would mean building an
+    # intermediate dict of 9 shared kwargs to hide a real difference (the sanity
+    # branch nulls total_score and sets parse_error). The signal is a lead, and
+    # this lead was checked and dismissed.
+    complexity_delta = _normalize_complexity_delta(data.get("complexity_delta"))
     if sanity_problems:
         return ReviewReport(
             decision=decision,
@@ -1678,6 +1739,7 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
             scores=scores,
             total_score=None,
             hard_gate=hard_gate,
+            complexity_delta=complexity_delta,
             token_usage=token_usage,
             prompt_style="engineering",
             parse_error="incomplete_content: " + "; ".join(sanity_problems),
@@ -1692,6 +1754,7 @@ def _parse_engineering_payload(data: Dict[str, Any], token_usage) -> ReviewRepor
         scores=scores,
         total_score=total_score,
         hard_gate=hard_gate,
+        complexity_delta=complexity_delta,
         whats_good=_str_list("whats_good"),
         recommended_actions=_str_list("recommended_actions"),
         token_usage=token_usage,
